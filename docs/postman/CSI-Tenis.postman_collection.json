@@ -1,0 +1,444 @@
+{
+  "info": {
+    "_postman_id": "c0fbe15d-e81b-4ad7-bc6b-8e4f922ce777",
+    "name": "CSI Tenis API",
+    "description": "Coleccion para probar endpoints publicos y admin del backend CSI Tenis.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://127.0.0.1:8000"
+    },
+    {
+      "key": "access_token",
+      "value": ""
+    },
+    {
+      "key": "refresh_token",
+      "value": ""
+    },
+    {
+      "key": "reservation_id",
+      "value": "1"
+    },
+    {
+      "key": "cancellation_request_id",
+      "value": "1"
+    },
+    {
+      "key": "target_date",
+      "value": "2026-05-20"
+    }
+  ],
+  "item": [
+    {
+      "name": "Auth",
+      "item": [
+        {
+          "name": "POST /api/token/",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"username\": \"admin\",\n  \"password\": \"admin123\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/token/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "token",
+                ""
+              ]
+            },
+            "description": "Obtiene access y refresh token JWT."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code === 200) {",
+                  "  const data = pm.response.json();",
+                  "  pm.collectionVariables.set('access_token', data.access || '');",
+                  "  pm.collectionVariables.set('refresh_token', data.refresh || '');",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "POST /api/token/refresh/",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"refresh\": \"{{refresh_token}}\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/token/refresh/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "token",
+                "refresh",
+                ""
+              ]
+            },
+            "description": "Renueva access token JWT."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code === 200) {",
+                  "  const data = pm.response.json();",
+                  "  pm.collectionVariables.set('access_token', data.access || '');",
+                  "}"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Public",
+      "item": [
+        {
+          "name": "GET /api/availability/",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}/api/availability/?date={{target_date}}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "availability",
+                ""
+              ],
+              "query": [
+                {
+                  "key": "date",
+                  "value": "{{target_date}}"
+                }
+              ]
+            },
+            "description": "Disponibilidad por fecha. Publico (20/min)."
+          }
+        },
+        {
+          "name": "POST /api/reservations/ (SINGLES)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"court\": 1,\n  \"date\": \"{{target_date}}\",\n  \"start_time\": \"18:00\",\n  \"game_mode\": \"SINGLES\",\n  \"contact_name\": \"Pedro Rodriguez\",\n  \"contact_phone\": \"2302123456\",\n  \"players\": [\n    {\n      \"first_name\": \"Pedro\",\n      \"last_name\": \"Rodriguez\",\n      \"is_member\": true\n    },\n    {\n      \"first_name\": \"Santi\",\n      \"last_name\": \"Fernandez\",\n      \"is_member\": false\n    }\n  ],\n  \"notes\": \"Reserva desde Postman\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/reservations/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "reservations",
+                ""
+              ]
+            },
+            "description": "Crea reserva normal de 90 minutos. Publico (20/min)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code === 201) {",
+                  "  const data = pm.response.json();",
+                  "  if (data.id) {",
+                  "    pm.collectionVariables.set('reservation_id', String(data.id));",
+                  "  }",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "POST /api/reservations/{id}/request-cancellation/",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"requester_name\": \"Pedro Rodriguez\",\n  \"requester_phone\": \"2302123456\",\n  \"reason\": \"No podemos asistir\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/reservations/{{reservation_id}}/request-cancellation/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "reservations",
+                "{{reservation_id}}",
+                "request-cancellation",
+                ""
+              ]
+            },
+            "description": "Solicita cancelacion hasta 3 horas antes del turno. Publico (20/min)."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Admin",
+      "auth": {
+        "type": "bearer",
+        "bearer": [
+          {
+            "key": "token",
+            "value": "{{access_token}}",
+            "type": "string"
+          }
+        ]
+      },
+      "item": [
+        {
+          "name": "GET /api/courts/",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}/api/courts/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "courts",
+                ""
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /api/courts/",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Cancha 6\",\n  \"active\": true\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/courts/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "courts",
+                ""
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /api/prices/",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}/api/prices/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "prices",
+                ""
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /api/reservations/?date=",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}/api/reservations/?date={{target_date}}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "reservations",
+                ""
+              ],
+              "query": [
+                {
+                  "key": "date",
+                  "value": "{{target_date}}"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "PATCH /api/reservations/{id}/cancel/",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"cancellation_reason\": \"Cancelada por admin\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/reservations/{{reservation_id}}/cancel/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "reservations",
+                "{{reservation_id}}",
+                "cancel",
+                ""
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /api/cancellation-requests/",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}/api/cancellation-requests/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "cancellation-requests",
+                ""
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code === 200) {",
+                  "  const data = pm.response.json();",
+                  "  if (Array.isArray(data) && data.length > 0 && data[0].id) {",
+                  "    pm.collectionVariables.set('cancellation_request_id', String(data[0].id));",
+                  "  }",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "PATCH /api/cancellation-requests/{id}/resolve/ APPROVED",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"status\": \"APPROVED\",\n  \"cancellation_reason\": \"Aprobada por admin\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/cancellation-requests/{{cancellation_request_id}}/resolve/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "cancellation-requests",
+                "{{cancellation_request_id}}",
+                "resolve",
+                ""
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST /api/recurring-rules/generate/",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{base_url}}/api/recurring-rules/generate/?days_ahead=90",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "recurring-rules",
+                "generate",
+                ""
+              ],
+              "query": [
+                {
+                  "key": "days_ahead",
+                  "value": "90"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
