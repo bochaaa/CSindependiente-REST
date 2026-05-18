@@ -2,6 +2,7 @@ from datetime import date
 
 from django.contrib.auth import get_user_model
 from django.db.models import Prefetch
+from django.db import OperationalError, transaction
 from drf_spectacular.utils import OpenApiParameter, OpenApiResponse, extend_schema, extend_schema_view
 from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
@@ -36,12 +37,19 @@ from .serializers import (
     CourtSerializer,
     GenerateRecurringReservationsResponseSerializer,
     PriceRuleSerializer,
+    RecurringRuleDeactivateResponseSerializer,
+    RecurringRuleDeactivateSerializer,
     RecurringReservationRuleSerializer,
     ReservationCreateSerializer,
     ReservationSerializer,
     SpecialScheduleSerializer,
 )
-from .services import cancel_reservation_by_admin, generate_availability_for_date, generate_recurring_reservations
+from .services import (
+    cancel_reservation_by_admin,
+    deactivate_recurring_rule,
+    generate_availability_for_date,
+    generate_recurring_reservations,
+)
 
 User = get_user_model()
 
@@ -279,13 +287,48 @@ class RecurringReservationRuleViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         serializer.save(created_by=self.request.user)
-        # Keep concrete CLASS reservations in sync right after rule creation.
-        generate_recurring_reservations(days_ahead=90)
+        self._schedule_recurring_generation()
 
     def perform_update(self, serializer):
         serializer.save()
-        # Re-run generation for the next window. Duplicates and conflicts are already guarded in service.
-        generate_recurring_reservations(days_ahead=90)
+        self._schedule_recurring_generation()
+
+    def _schedule_recurring_generation(self):
+        # In SQLite dev mode, immediate heavy writes can hit "database is locked".
+        # Run generation after commit and swallow transient lock errors.
+        def _run_generation():
+            try:
+                generate_recurring_reservations(days_ahead=90)
+            except OperationalError:
+                # Non-fatal for request flow. Admin can re-run via /recurring-rules/generate/.
+                return
+
+        transaction.on_commit(_run_generation, robust=True)
+
+    @extend_schema(
+        description=(
+            "Deactivate recurring rule and cancel all future generated CLASS reservations "
+            "for this rule. Admin only."
+        ),
+        request=RecurringRuleDeactivateSerializer,
+        responses={200: RecurringRuleDeactivateResponseSerializer},
+    )
+    @action(detail=True, methods=("patch",), url_path="deactivate")
+    def deactivate(self, request, pk=None):
+        recurring_rule = self.get_object()
+        serializer = RecurringRuleDeactivateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        reason = serializer.validated_data.get("cancellation_reason", "") or "Regla recurrente desactivada por admin."
+        rule, cancelled_count = deactivate_recurring_rule(
+            recurring_rule=recurring_rule,
+            deactivated_by=request.user,
+            cancellation_reason=reason,
+        )
+        response_data = {
+            "rule": RecurringReservationRuleSerializer(rule).data,
+            "cancelled_future_classes": cancelled_count,
+        }
+        return Response(response_data)
 
 
 @extend_schema_view(

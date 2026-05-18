@@ -319,6 +319,90 @@ class ReservationBusinessRulesTests(APITestCase):
         )
         self.assertEqual(generated.count(), 1)
 
+    def test_recurring_rule_allows_null_notes(self):
+        target_date = timezone.localdate() + timedelta(days=1)
+        day = DayOfWeek.values[target_date.weekday()]
+        self.client.force_authenticate(user=self.admin)
+        response = self.client.post(
+            reverse("recurring-rule-list"),
+            {
+                "court": self.court.id,
+                "title": "Clase sin notas",
+                "days_of_week": [day],
+                "start_time": "16:00",
+                "start_date": target_date.isoformat(),
+                "end_date": target_date.isoformat(),
+                "active": True,
+                "notes": None,
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data["notes"], "")
+
+    def test_deactivate_recurring_rule_cancels_future_classes_and_frees_slot(self):
+        target_date = timezone.localdate() + timedelta(days=1)
+        day = DayOfWeek.values[target_date.weekday()]
+        self.client.force_authenticate(user=self.admin)
+
+        first_rule_response = self.client.post(
+            reverse("recurring-rule-list"),
+            {
+                "court": self.court.id,
+                "title": "Clase Juan",
+                "days_of_week": [day],
+                "start_time": "14:00",
+                "start_date": target_date.isoformat(),
+                "end_date": target_date.isoformat(),
+                "active": True,
+                "notes": "",
+            },
+            format="json",
+        )
+        self.assertEqual(first_rule_response.status_code, status.HTTP_201_CREATED)
+        first_rule_id = first_rule_response.data["id"]
+        first_classes = Reservation.objects.filter(
+            reservation_type=ReservationType.CLASS,
+            recurring_rule_id=first_rule_id,
+        )
+        self.assertEqual(first_classes.count(), 1)
+        self.assertEqual(first_classes.first().status, ReservationStatus.CONFIRMED)
+
+        deactivate_response = self.client.patch(
+            reverse("recurring-rule-deactivate", args=[first_rule_id]),
+            {"cancellation_reason": "Profesor no disponible"},
+            format="json",
+        )
+        self.assertEqual(deactivate_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(deactivate_response.data["cancelled_future_classes"], 1)
+
+        first_class = first_classes.first()
+        first_class.refresh_from_db()
+        self.assertEqual(first_class.status, ReservationStatus.CANCELLED)
+
+        second_rule_response = self.client.post(
+            reverse("recurring-rule-list"),
+            {
+                "court": self.court.id,
+                "title": "Clase Josefina",
+                "days_of_week": [day],
+                "start_time": "14:00",
+                "start_date": target_date.isoformat(),
+                "end_date": target_date.isoformat(),
+                "active": True,
+                "notes": "",
+            },
+            format="json",
+        )
+        self.assertEqual(second_rule_response.status_code, status.HTTP_201_CREATED)
+        second_rule_id = second_rule_response.data["id"]
+        second_classes = Reservation.objects.filter(
+            reservation_type=ReservationType.CLASS,
+            recurring_rule_id=second_rule_id,
+            status=ReservationStatus.CONFIRMED,
+        )
+        self.assertEqual(second_classes.count(), 1)
+
     def test_admin_endpoint_requires_jwt_for_write(self):
         create_court_payload = {"name": "Cancha 2", "active": True}
 

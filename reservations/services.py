@@ -521,6 +521,32 @@ def resolve_cancellation_request(
 
 
 @transaction.atomic
+def deactivate_recurring_rule(
+    recurring_rule: RecurringReservationRule,
+    deactivated_by=None,
+    cancellation_reason: str = "Regla recurrente desactivada por admin.",
+) -> tuple[RecurringReservationRule, int]:
+    locked_rule = RecurringReservationRule.objects.select_for_update().get(id=recurring_rule.id)
+    if locked_rule.active:
+        locked_rule.active = False
+        locked_rule.save(update_fields=("active", "updated_at"))
+
+    now = timezone.now()
+    cancelled_count = Reservation.objects.filter(
+        recurring_rule=locked_rule,
+        reservation_type=ReservationType.CLASS,
+        start_datetime__gte=now,
+    ).exclude(status=ReservationStatus.CANCELLED).update(
+        status=ReservationStatus.CANCELLED,
+        cancelled_at=now,
+        cancelled_by=deactivated_by if getattr(deactivated_by, "is_authenticated", False) else None,
+        cancellation_reason=cancellation_reason,
+        updated_at=now,
+    )
+    return locked_rule, cancelled_count
+
+
+@transaction.atomic
 def generate_recurring_reservations(days_ahead: int = 90) -> int:
     today = timezone.localdate()
     limit_date = today + timedelta(days=days_ahead)

@@ -95,6 +95,7 @@ Response 200:
 - `PATCH /api/recurring-rules/{id}/`
 - `PUT /api/recurring-rules/{id}/`
 - `DELETE /api/recurring-rules/{id}/`
+- `PATCH /api/recurring-rules/{id}/deactivate/`
 - `POST /api/recurring-rules/generate/?days_ahead=90`
 
 ## 4) Payloads clave
@@ -263,6 +264,8 @@ Campos opcionales en `unavailable_ranges`:
 - Al crear o editar una regla, backend dispara generacion automatica de clases concretas `CLASS` para los proximos 90 dias.
 - Tambien se puede forzar manualmente por endpoint admin `POST /api/recurring-rules/generate/`.
 - Se evitan duplicados de clases por `recurring_rule + court + start_datetime`.
+- Para "eliminar" una clase recurrente sin perder historial, usar `PATCH /api/recurring-rules/{id}/deactivate/`.
+- `deactivate` pone `active=false` en la regla y cancela (`status=CANCELLED`) todas las clases futuras generadas por esa regla.
 
 ## 5.7 Notificaciones
 

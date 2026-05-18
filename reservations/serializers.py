@@ -193,6 +193,7 @@ class CancellationRequestResolveSerializer(serializers.Serializer):
 class RecurringReservationRuleSerializer(serializers.ModelSerializer):
     court_name = serializers.CharField(source="court.name", read_only=True)
     end_time = serializers.SerializerMethodField(read_only=True)
+    notes = serializers.CharField(required=False, allow_blank=True, allow_null=True)
 
     class Meta:
         model = RecurringReservationRule
@@ -237,6 +238,25 @@ class RecurringReservationRuleSerializer(serializers.ModelSerializer):
                     {"detail": "La clase recurrente esta fuera del horario del club."}
                 )
         return attrs
+
+    def create(self, validated_data):
+        if validated_data.get("notes") is None:
+            validated_data["notes"] = ""
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        if "notes" in validated_data and validated_data["notes"] is None:
+            validated_data["notes"] = ""
+        return super().update(instance, validated_data)
+
+
+class RecurringRuleDeactivateSerializer(serializers.Serializer):
+    cancellation_reason = serializers.CharField(required=False, allow_blank=True)
+
+
+class RecurringRuleDeactivateResponseSerializer(serializers.Serializer):
+    rule = RecurringReservationRuleSerializer()
+    cancelled_future_classes = serializers.IntegerField()
 
 
 class BlockedSlotSerializer(serializers.ModelSerializer):

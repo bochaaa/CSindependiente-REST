@@ -17,6 +17,25 @@ python -m venv .venv
 .\.venv\Scripts\python.exe manage.py runserver
 ```
 
+## Configuracion Produccion (PostgreSQL)
+
+1. Crear archivo `.env` tomando como base `.env.production.example`.
+2. Configurar:
+   - `DB_ENGINE=postgres`
+   - `POSTGRES_DB=sport_turnos`
+   - `POSTGRES_USER=turnos_user`
+   - `POSTGRES_PASSWORD=...`
+   - `POSTGRES_HOST` y `POSTGRES_PORT`
+3. Configurar dominios:
+   - `DJANGO_ALLOWED_HOSTS`
+   - `DJANGO_CORS_ALLOWED_ORIGINS`
+   - `DJANGO_CSRF_TRUSTED_ORIGINS`
+4. Ejecutar migraciones:
+
+```powershell
+.\.venv\Scripts\python.exe manage.py migrate
+```
+
 ## Documentacion API (Swagger)
 
 - OpenAPI schema: `http://127.0.0.1:8000/api/schema/`

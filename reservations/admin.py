@@ -1,5 +1,6 @@
 from django import forms
 from django.contrib import admin
+from django.utils import timezone
 
 from .models import (
     BlockedSlot,
@@ -14,6 +15,7 @@ from .models import (
     ReservationPlayer,
     SpecialSchedule,
 )
+from .services import deactivate_recurring_rule
 
 
 class RecurringReservationRuleAdminForm(forms.ModelForm):
@@ -43,9 +45,30 @@ class RecurringReservationRuleAdminForm(forms.ModelForm):
 @admin.register(RecurringReservationRule)
 class RecurringReservationRuleAdmin(admin.ModelAdmin):
     form = RecurringReservationRuleAdminForm
-    list_display = ("title", "court", "start_time", "start_date", "end_date", "active")
+    list_display = ("id", "title", "court", "start_time", "computed_end_time", "start_date", "end_date", "active")
     list_filter = ("active", "court")
     search_fields = ("title", "court__name")
+    actions = ("deactivate_and_cancel_future_classes",)
+    readonly_fields = ("created_by", "created_at", "updated_at")
+
+    @admin.display(description="End time")
+    def computed_end_time(self, obj):
+        return obj.computed_end_time
+
+    @admin.action(description="Deactivate rules and cancel future generated classes")
+    def deactivate_and_cancel_future_classes(self, request, queryset):
+        cancelled_total = 0
+        for rule in queryset:
+            _, cancelled_count = deactivate_recurring_rule(
+                recurring_rule=rule,
+                deactivated_by=request.user,
+                cancellation_reason="Desactivada desde Django admin.",
+            )
+            cancelled_total += cancelled_count
+        self.message_user(
+            request,
+            f"Rules deactivated: {queryset.count()}. Future classes cancelled: {cancelled_total}.",
+        )
 
 
 @admin.register(Reservation)
@@ -63,12 +86,57 @@ class ReservationAdmin(admin.ModelAdmin):
     list_filter = ("status", "reservation_type", "court")
     search_fields = ("contact_name", "title", "contact_phone", "court__name")
     ordering = ("-start_datetime",)
+    readonly_fields = ("created_at", "updated_at", "cancelled_at")
 
 
 admin.site.register(Court)
-admin.site.register(ClubSchedule)
-admin.site.register(SpecialSchedule)
-admin.site.register(PriceRule)
+
+
+@admin.register(ClubSchedule)
+class ClubScheduleAdmin(admin.ModelAdmin):
+    list_display = ("day_of_week", "open_time", "close_time", "active")
+    list_filter = ("active",)
+    ordering = ("day_of_week",)
+
+
+@admin.register(SpecialSchedule)
+class SpecialScheduleAdmin(admin.ModelAdmin):
+    list_display = ("date", "closed", "open_time", "close_time", "reason")
+    list_filter = ("closed",)
+    search_fields = ("reason",)
+    ordering = ("date",)
+
+
+@admin.register(PriceRule)
+class PriceRuleAdmin(admin.ModelAdmin):
+    list_display = ("id", "game_mode", "player_type", "price", "active", "valid_from", "valid_to")
+    list_filter = ("game_mode", "player_type", "active")
+    search_fields = ("game_mode", "player_type")
+    ordering = ("-valid_from", "game_mode", "player_type")
+    actions = ("duplicate_prices_for_today",)
+
+    @admin.action(description="Duplicate selected prices as active from today")
+    def duplicate_prices_for_today(self, request, queryset):
+        today = timezone.localdate()
+        created_count = 0
+        for rule in queryset:
+            if not type(rule).objects.filter(
+                game_mode=rule.game_mode,
+                player_type=rule.player_type,
+                valid_from=today,
+            ).exists():
+                type(rule).objects.create(
+                    game_mode=rule.game_mode,
+                    player_type=rule.player_type,
+                    price=rule.price,
+                    active=True,
+                    valid_from=today,
+                    valid_to=None,
+                )
+                created_count += 1
+        self.message_user(request, f"New price rows created for today: {created_count}.")
+
+
 admin.site.register(ReservationPlayer)
 admin.site.register(BlockedSlot)
 admin.site.register(CancellationRequest)
