@@ -2,6 +2,7 @@ from datetime import datetime, time, timedelta
 from decimal import Decimal
 
 from django.contrib.auth import get_user_model
+from django.core.cache import cache
 from django.core.management import call_command
 from django.test import TestCase
 from django.urls import reverse
@@ -30,6 +31,7 @@ from .services import generate_recurring_reservations
 
 class ReservationBusinessRulesTests(APITestCase):
     def setUp(self):
+        cache.clear()
         self.User = get_user_model()
         self.admin = self.User.objects.create_user(
             username="admin",
@@ -377,6 +379,84 @@ class ReservationBusinessRulesTests(APITestCase):
             start_datetime__date=target_date,
         )
         self.assertEqual(generated.count(), 1)
+
+    def test_recurring_rule_create_endpoint_generates_90_day_horizon(self):
+        today = timezone.localdate()
+        self.client.force_authenticate(user=self.admin)
+        response = self.client.post(
+            reverse("recurring-rule-list"),
+            {
+                "court": self.court.id,
+                "title": "Clase Diario",
+                "days_of_week": list(DayOfWeek.values),
+                "start_time": "10:00",
+                "start_date": today.isoformat(),
+                "end_date": None,
+                "active": True,
+                "notes": "Horizonte 90 dias",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        created_rule_id = response.data["id"]
+        generated = Reservation.objects.filter(
+            reservation_type=ReservationType.CLASS,
+            recurring_rule_id=created_rule_id,
+        ).order_by("-start_datetime")
+        self.assertEqual(generated.count(), 91)
+        self.assertEqual(generated.first().start_datetime.date(), today + timedelta(days=90))
+
+    def test_recurring_rule_update_regenerates_future_classes(self):
+        initial_date = timezone.localdate() + timedelta(days=1)
+        initial_day = DayOfWeek.values[initial_date.weekday()]
+        self.client.force_authenticate(user=self.admin)
+
+        create_response = self.client.post(
+            reverse("recurring-rule-list"),
+            {
+                "court": self.court.id,
+                "title": "Clase Reprogramable",
+                "days_of_week": [initial_day],
+                "start_time": "17:00",
+                "start_date": initial_date.isoformat(),
+                "end_date": initial_date.isoformat(),
+                "active": True,
+                "notes": "",
+            },
+            format="json",
+        )
+        self.assertEqual(create_response.status_code, status.HTTP_201_CREATED)
+        rule_id = create_response.data["id"]
+        old_class = Reservation.objects.get(
+            reservation_type=ReservationType.CLASS,
+            recurring_rule_id=rule_id,
+            start_datetime__date=initial_date,
+        )
+        self.assertEqual(old_class.status, ReservationStatus.CONFIRMED)
+
+        updated_date = timezone.localdate() + timedelta(days=2)
+        updated_day = DayOfWeek.values[updated_date.weekday()]
+        update_response = self.client.patch(
+            reverse("recurring-rule-detail", args=[rule_id]),
+            {
+                "days_of_week": [updated_day],
+                "start_time": "18:00",
+                "start_date": updated_date.isoformat(),
+                "end_date": updated_date.isoformat(),
+            },
+            format="json",
+        )
+        self.assertEqual(update_response.status_code, status.HTTP_200_OK)
+
+        old_class.refresh_from_db()
+        self.assertEqual(old_class.status, ReservationStatus.CANCELLED)
+        new_classes = Reservation.objects.filter(
+            reservation_type=ReservationType.CLASS,
+            recurring_rule_id=rule_id,
+            start_datetime__date=updated_date,
+            status=ReservationStatus.CONFIRMED,
+        )
+        self.assertEqual(new_classes.count(), 1)
 
     def test_recurring_rule_allows_null_notes(self):
         target_date = timezone.localdate() + timedelta(days=1)

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 
-from django.db import transaction
+from django.db import OperationalError, transaction
 from django.db.models import Q
 from django.utils import timezone
 from rest_framework import serializers
@@ -32,6 +32,7 @@ from .models import (
 
 NORMAL_RESERVATION_MINUTES = 90
 CLASS_RESERVATION_MINUTES = 60
+RECURRING_GENERATION_RETRY_ATTEMPTS = 3
 
 DAY_OF_WEEK_BY_INDEX = {
     0: DayOfWeek.MONDAY,
@@ -576,6 +577,118 @@ def deactivate_recurring_rule(
     return locked_rule, cancelled_count
 
 
+def _generate_reservations_for_rule(
+    rule: RecurringReservationRule,
+    today: date,
+    limit_date: date,
+) -> int:
+    generated_count = 0
+    if not rule.court.active:
+        return 0
+
+    generation_start = max(today, rule.start_date)
+    generation_end = min(rule.end_date, limit_date) if rule.end_date else limit_date
+    if generation_start > generation_end:
+        return 0
+
+    current_date = generation_start
+    while current_date <= generation_end:
+        weekday = DAY_OF_WEEK_BY_INDEX[current_date.weekday()]
+        if weekday not in rule.days_of_week:
+            current_date += timedelta(days=1)
+            continue
+
+        start_datetime = combine_local_datetime(current_date, rule.start_time)
+        end_datetime = start_datetime + timedelta(minutes=CLASS_RESERVATION_MINUTES)
+        schedule = get_schedule_for_date(current_date)
+        if schedule:
+            open_time, close_time = schedule
+            open_datetime = combine_local_datetime(current_date, open_time)
+            close_datetime = combine_local_datetime(current_date, close_time)
+            if start_datetime >= open_datetime and end_datetime <= close_datetime:
+                already_exists = Reservation.objects.filter(
+                    reservation_type=ReservationType.CLASS,
+                    recurring_rule=rule,
+                    court=rule.court,
+                    start_datetime=start_datetime,
+                ).exists()
+                if not already_exists and not check_overlap(
+                    court=rule.court, start_datetime=start_datetime, end_datetime=end_datetime
+                ):
+                    Reservation.objects.create(
+                        court=rule.court,
+                        reservation_type=ReservationType.CLASS,
+                        game_mode=None,
+                        title=rule.title,
+                        contact_name="Admin",
+                        contact_phone="N/A",
+                        start_datetime=start_datetime,
+                        end_datetime=end_datetime,
+                        status=ReservationStatus.CONFIRMED,
+                        total_price=Decimal("0.00"),
+                        notes=rule.notes,
+                        created_by=rule.created_by,
+                        recurring_rule=rule,
+                    )
+                    generated_count += 1
+        current_date += timedelta(days=1)
+    return generated_count
+
+
+@transaction.atomic
+def _sync_single_recurring_rule_generation(
+    recurring_rule_id: int,
+    days_ahead: int,
+    regenerate_future_classes: bool,
+) -> int:
+    locked_rule = (
+        RecurringReservationRule.objects.select_for_update()
+        .select_related("court")
+        .get(id=recurring_rule_id)
+    )
+
+    if regenerate_future_classes:
+        now = timezone.now()
+        Reservation.objects.filter(
+            recurring_rule=locked_rule,
+            reservation_type=ReservationType.CLASS,
+            start_datetime__gte=now,
+        ).exclude(status=ReservationStatus.CANCELLED).update(
+            status=ReservationStatus.CANCELLED,
+            cancelled_at=now,
+            cancellation_reason="Regla recurrente actualizada; clases futuras regeneradas.",
+            updated_at=now,
+        )
+
+    if not locked_rule.active or not locked_rule.court.active:
+        return 0
+
+    today = timezone.localdate()
+    limit_date = today + timedelta(days=days_ahead)
+    return _generate_reservations_for_rule(rule=locked_rule, today=today, limit_date=limit_date)
+
+
+def ensure_recurring_rule_generation(
+    recurring_rule_id: int,
+    days_ahead: int = 90,
+    regenerate_future_classes: bool = False,
+) -> int:
+    attempts = max(1, RECURRING_GENERATION_RETRY_ATTEMPTS)
+    last_error = None
+    for _ in range(attempts):
+        try:
+            return _sync_single_recurring_rule_generation(
+                recurring_rule_id=recurring_rule_id,
+                days_ahead=days_ahead,
+                regenerate_future_classes=regenerate_future_classes,
+            )
+        except OperationalError as exc:
+            last_error = exc
+    if last_error:
+        raise last_error
+    return 0
+
+
 @transaction.atomic
 def generate_recurring_reservations(days_ahead: int = 90) -> int:
     today = timezone.localdate()
@@ -587,52 +700,9 @@ def generate_recurring_reservations(days_ahead: int = 90) -> int:
         .filter(active=True)
     )
     for rule in rules:
-        if not rule.court.active:
-            continue
-        generation_start = max(today, rule.start_date)
-        generation_end = min(rule.end_date, limit_date) if rule.end_date else limit_date
-        if generation_start > generation_end:
-            continue
-
-        current_date = generation_start
-        while current_date <= generation_end:
-            weekday = DAY_OF_WEEK_BY_INDEX[current_date.weekday()]
-            if weekday not in rule.days_of_week:
-                current_date += timedelta(days=1)
-                continue
-
-            start_datetime = combine_local_datetime(current_date, rule.start_time)
-            end_datetime = start_datetime + timedelta(minutes=CLASS_RESERVATION_MINUTES)
-            schedule = get_schedule_for_date(current_date)
-            if schedule:
-                open_time, close_time = schedule
-                open_datetime = combine_local_datetime(current_date, open_time)
-                close_datetime = combine_local_datetime(current_date, close_time)
-                if start_datetime >= open_datetime and end_datetime <= close_datetime:
-                    already_exists = Reservation.objects.filter(
-                        reservation_type=ReservationType.CLASS,
-                        recurring_rule=rule,
-                        court=rule.court,
-                        start_datetime=start_datetime,
-                    ).exists()
-                    if not already_exists and not check_overlap(
-                        court=rule.court, start_datetime=start_datetime, end_datetime=end_datetime
-                    ):
-                        Reservation.objects.create(
-                            court=rule.court,
-                            reservation_type=ReservationType.CLASS,
-                            game_mode=None,
-                            title=rule.title,
-                            contact_name="Admin",
-                            contact_phone="N/A",
-                            start_datetime=start_datetime,
-                            end_datetime=end_datetime,
-                            status=ReservationStatus.CONFIRMED,
-                            total_price=Decimal("0.00"),
-                            notes=rule.notes,
-                            created_by=rule.created_by,
-                            recurring_rule=rule,
-                        )
-                        generated_count += 1
-            current_date += timedelta(days=1)
+        generated_count += _generate_reservations_for_rule(
+            rule=rule,
+            today=today,
+            limit_date=limit_date,
+        )
     return generated_count

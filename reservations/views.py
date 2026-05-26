@@ -6,6 +6,7 @@ from django.db import OperationalError, transaction
 from drf_spectacular.utils import OpenApiParameter, OpenApiResponse, extend_schema, extend_schema_view
 from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
+from rest_framework.exceptions import APIException
 from rest_framework.permissions import AllowAny, IsAdminUser, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
@@ -48,12 +49,19 @@ from .serializers import (
 from .services import (
     cancel_reservation_by_admin,
     deactivate_recurring_rule,
+    ensure_recurring_rule_generation,
     generate_availability_for_date,
     generate_recurring_reservations,
     set_reservation_payment_status,
 )
 
 User = get_user_model()
+
+
+class RecurringGenerationUnavailable(APIException):
+    status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    default_detail = "No se pudo generar el calendario recurrente. Intenta nuevamente."
+    default_code = "recurring_generation_unavailable"
 
 
 @extend_schema_view(
@@ -335,24 +343,28 @@ class RecurringReservationRuleViewSet(viewsets.ModelViewSet):
     permission_classes = (IsAdminUser,)
 
     def perform_create(self, serializer):
-        serializer.save(created_by=self.request.user)
-        self._schedule_recurring_generation()
+        try:
+            with transaction.atomic():
+                rule = serializer.save(created_by=self.request.user)
+                ensure_recurring_rule_generation(
+                    recurring_rule_id=rule.id,
+                    days_ahead=90,
+                    regenerate_future_classes=False,
+                )
+        except OperationalError as exc:
+            raise RecurringGenerationUnavailable() from exc
 
     def perform_update(self, serializer):
-        serializer.save()
-        self._schedule_recurring_generation()
-
-    def _schedule_recurring_generation(self):
-        # In SQLite dev mode, immediate heavy writes can hit "database is locked".
-        # Run generation after commit and swallow transient lock errors.
-        def _run_generation():
-            try:
-                generate_recurring_reservations(days_ahead=90)
-            except OperationalError:
-                # Non-fatal for request flow. Admin can re-run via /recurring-rules/generate/.
-                return
-
-        transaction.on_commit(_run_generation, robust=True)
+        try:
+            with transaction.atomic():
+                rule = serializer.save()
+                ensure_recurring_rule_generation(
+                    recurring_rule_id=rule.id,
+                    days_ahead=90,
+                    regenerate_future_classes=True,
+                )
+        except OperationalError as exc:
+            raise RecurringGenerationUnavailable() from exc
 
     @extend_schema(
         description=(
