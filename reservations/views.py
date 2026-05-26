@@ -37,6 +37,7 @@ from .serializers import (
     CourtSerializer,
     GenerateRecurringReservationsResponseSerializer,
     PriceRuleSerializer,
+    ReservationPaymentStatusSerializer,
     RecurringRuleDeactivateResponseSerializer,
     RecurringRuleDeactivateSerializer,
     RecurringReservationRuleSerializer,
@@ -49,6 +50,7 @@ from .services import (
     deactivate_recurring_rule,
     generate_availability_for_date,
     generate_recurring_reservations,
+    set_reservation_payment_status,
 )
 
 User = get_user_model()
@@ -145,7 +147,10 @@ class AvailabilityAPIView(APIView):
 
 @extend_schema_view(
     list=extend_schema(
-        description="List reservations. Admin only. Optional filter: ?date=YYYY-MM-DD"
+        description=(
+            "List reservations. Admin only. Optional filters: "
+            "?date=YYYY-MM-DD, ?is_paid=true|false, ?unpaid=true|false"
+        )
     ),
     retrieve=extend_schema(description="Retrieve one reservation. Admin only."),
     create=extend_schema(description="Create a NORMAL reservation (90 minutes). Public endpoint."),
@@ -165,7 +170,7 @@ class ReservationViewSet(
     def get_permissions(self):
         if self.action in ("create", "request_cancellation"):
             return [AllowAny()]
-        if self.action in ("cancel", "list", "retrieve"):
+        if self.action in ("cancel", "mark_payment", "list", "retrieve"):
             return [IsAdminUser()]
         return super().get_permissions()
 
@@ -181,13 +186,37 @@ class ReservationViewSet(
     def get_queryset(self):
         queryset = super().get_queryset()
         date_filter = self.request.query_params.get("date")
+        is_paid_filter = self.request.query_params.get("is_paid")
+        unpaid_filter = self.request.query_params.get("unpaid")
         if date_filter:
             try:
                 parsed = date.fromisoformat(date_filter)
                 queryset = queryset.filter(start_datetime__date=parsed)
             except ValueError:
                 return queryset.none()
+        if is_paid_filter is not None:
+            parsed_bool = self._parse_bool_query_param(is_paid_filter)
+            if parsed_bool is None:
+                return queryset.none()
+            queryset = queryset.filter(is_paid=parsed_bool)
+        if unpaid_filter is not None:
+            parsed_bool = self._parse_bool_query_param(unpaid_filter)
+            if parsed_bool is None:
+                return queryset.none()
+            if parsed_bool:
+                queryset = queryset.filter(is_paid=False)
+            else:
+                queryset = queryset.filter(is_paid=True)
         return queryset.order_by("start_datetime")
+
+    @staticmethod
+    def _parse_bool_query_param(value: str) -> bool | None:
+        normalized = value.strip().lower()
+        if normalized in ("true", "1", "yes"):
+            return True
+        if normalized in ("false", "0", "no"):
+            return False
+        return None
 
     def get_serializer_class(self):
         if self.action == "create":
@@ -210,6 +239,26 @@ class ReservationViewSet(
             cancellation_reason=serializer.validated_data.get("cancellation_reason", ""),
         )
         return Response(ReservationSerializer(cancelled).data)
+
+    @extend_schema(
+        description=(
+            "Confirm or revert payment status for a reservation. Admin only. "
+            "Use is_paid=true to confirm payment, is_paid=false to mark unpaid."
+        ),
+        request=ReservationPaymentStatusSerializer,
+        responses={200: ReservationSerializer},
+    )
+    @action(detail=True, methods=("patch",), url_path="payment")
+    def mark_payment(self, request, pk=None):
+        reservation = self.get_object()
+        serializer = ReservationPaymentStatusSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        updated = set_reservation_payment_status(
+            reservation=reservation,
+            is_paid=serializer.validated_data["is_paid"],
+            confirmed_by=request.user,
+        )
+        return Response(ReservationSerializer(updated).data)
 
     @extend_schema(
         description=(

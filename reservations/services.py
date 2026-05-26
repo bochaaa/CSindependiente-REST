@@ -478,6 +478,36 @@ def cancel_reservation_by_admin(
 
 
 @transaction.atomic
+def set_reservation_payment_status(
+    reservation: Reservation,
+    is_paid: bool,
+    confirmed_by,
+) -> Reservation:
+    locked_reservation = Reservation.objects.select_for_update().get(id=reservation.id)
+    if is_paid and locked_reservation.status == ReservationStatus.CANCELLED:
+        raise serializers.ValidationError(
+            {"detail": "No se puede confirmar pago de una reserva cancelada."}
+        )
+
+    if locked_reservation.is_paid == is_paid:
+        return locked_reservation
+
+    if is_paid:
+        locked_reservation.is_paid = True
+        locked_reservation.paid_at = timezone.now()
+        locked_reservation.paid_confirmed_by = (
+            confirmed_by if getattr(confirmed_by, "is_authenticated", False) else None
+        )
+    else:
+        locked_reservation.is_paid = False
+        locked_reservation.paid_at = None
+        locked_reservation.paid_confirmed_by = None
+
+    locked_reservation.save(update_fields=("is_paid", "paid_at", "paid_confirmed_by", "updated_at"))
+    return locked_reservation
+
+
+@transaction.atomic
 def resolve_cancellation_request(
     cancellation_request: CancellationRequest,
     resolution_status: str,

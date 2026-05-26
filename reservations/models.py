@@ -211,6 +211,15 @@ class Reservation(TimestampedModel):
         default=ReservationStatus.CONFIRMED,
     )
     total_price = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    is_paid = models.BooleanField(default=False)
+    paid_at = models.DateTimeField(null=True, blank=True)
+    paid_confirmed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="paid_reservations",
+    )
     notes = models.TextField(blank=True)
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -242,6 +251,7 @@ class Reservation(TimestampedModel):
             models.Index(fields=("court", "start_datetime")),
             models.Index(fields=("court", "end_datetime")),
             models.Index(fields=("status",)),
+            models.Index(fields=("is_paid",)),
         ]
         constraints = [
             models.UniqueConstraint(

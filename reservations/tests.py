@@ -36,6 +36,11 @@ class ReservationBusinessRulesTests(APITestCase):
             password="admin123",
             is_staff=True,
         )
+        self.normal_user = self.User.objects.create_user(
+            username="user",
+            password="user123",
+            is_staff=False,
+        )
         self.court = self._create_court()
         self._create_default_schedules()
         self._create_price_rules()
@@ -211,6 +216,60 @@ class ReservationBusinessRulesTests(APITestCase):
         )
         self.assertEqual(cancel_response.status_code, status.HTTP_200_OK)
         self.assertEqual(cancel_response.data["status"], ReservationStatus.CANCELLED)
+
+    def test_admin_can_confirm_reservation_payment(self):
+        create_response = self.client.post(reverse("reservation-list"), self._reservation_payload(), format="json")
+        reservation_id = create_response.data["id"]
+
+        self.client.force_authenticate(user=self.admin)
+        payment_response = self.client.patch(
+            reverse("reservation-mark-payment", args=[reservation_id]),
+            {"is_paid": True},
+            format="json",
+        )
+        self.assertEqual(payment_response.status_code, status.HTTP_200_OK)
+        self.assertTrue(payment_response.data["is_paid"])
+        self.assertIsNotNone(payment_response.data["paid_at"])
+        self.assertEqual(payment_response.data["paid_confirmed_by"], self.admin.id)
+
+        reservation = Reservation.objects.get(id=reservation_id)
+        self.assertTrue(reservation.is_paid)
+        self.assertIsNotNone(reservation.paid_at)
+        self.assertEqual(reservation.paid_confirmed_by_id, self.admin.id)
+
+    def test_non_admin_cannot_confirm_reservation_payment(self):
+        create_response = self.client.post(reverse("reservation-list"), self._reservation_payload(), format="json")
+        reservation_id = create_response.data["id"]
+
+        self.client.force_authenticate(user=self.normal_user)
+        payment_response = self.client.patch(
+            reverse("reservation-mark-payment", args=[reservation_id]),
+            {"is_paid": True},
+            format="json",
+        )
+        self.assertEqual(payment_response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_admin_can_filter_unpaid_reservations(self):
+        first_response = self.client.post(reverse("reservation-list"), self._reservation_payload(), format="json")
+        second_response = self.client.post(
+            reverse("reservation-list"),
+            self._reservation_payload(start_time="20:00"),
+            format="json",
+        )
+        first_id = first_response.data["id"]
+        second_id = second_response.data["id"]
+
+        self.client.force_authenticate(user=self.admin)
+        self.client.patch(
+            reverse("reservation-mark-payment", args=[second_id]),
+            {"is_paid": True},
+            format="json",
+        )
+        unpaid_response = self.client.get(f"{reverse('reservation-list')}?is_paid=false")
+        self.assertEqual(unpaid_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(unpaid_response.data), 1)
+        self.assertEqual(unpaid_response.data[0]["id"], first_id)
+        self.assertFalse(unpaid_response.data[0]["is_paid"])
 
     def test_public_user_can_request_cancellation(self):
         create_response = self.client.post(reverse("reservation-list"), self._reservation_payload(), format="json")

@@ -78,6 +78,7 @@ class ReservationPlayerInputSerializer(serializers.Serializer):
 class ReservationSerializer(serializers.ModelSerializer):
     players = ReservationPlayerSerializer(many=True, read_only=True)
     court_name = serializers.CharField(source="court.name", read_only=True)
+    paid_confirmed_by_username = serializers.CharField(source="paid_confirmed_by.username", read_only=True)
 
     class Meta:
         model = Reservation
@@ -94,6 +95,10 @@ class ReservationSerializer(serializers.ModelSerializer):
             "end_datetime",
             "status",
             "total_price",
+            "is_paid",
+            "paid_at",
+            "paid_confirmed_by",
+            "paid_confirmed_by_username",
             "notes",
             "players",
             "recurring_rule",
@@ -123,6 +128,10 @@ class ReservationCreateSerializer(serializers.Serializer):
 
 class CancelReservationSerializer(serializers.Serializer):
     cancellation_reason = serializers.CharField(required=False, allow_blank=True)
+
+
+class ReservationPaymentStatusSerializer(serializers.Serializer):
+    is_paid = serializers.BooleanField()
 
 
 class CancellationRequestCreateSerializer(serializers.Serializer):

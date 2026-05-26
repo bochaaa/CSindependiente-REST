@@ -78,15 +78,18 @@ class ReservationAdmin(admin.ModelAdmin):
         "court",
         "reservation_type",
         "status",
+        "is_paid",
+        "paid_at",
+        "paid_confirmed_by",
         "contact_name",
         "title",
         "start_datetime",
         "end_datetime",
     )
-    list_filter = ("status", "reservation_type", "court")
+    list_filter = ("status", "reservation_type", "court", "is_paid")
     search_fields = ("contact_name", "title", "contact_phone", "court__name")
     ordering = ("-start_datetime",)
-    readonly_fields = ("created_at", "updated_at", "cancelled_at")
+    readonly_fields = ("created_at", "updated_at", "cancelled_at", "paid_at")
 
 
 admin.site.register(Court)
