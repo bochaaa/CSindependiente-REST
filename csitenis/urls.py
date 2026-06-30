@@ -25,7 +25,7 @@ from reservations.views import (
 )
 
 urlpatterns = [
-    path('admin/', admin.site.urls),
+    path('django-admin/', admin.site.urls),
     path('api/', include('reservations.urls')),
     path('api/token/', AdminTokenObtainPairView.as_view(), name='token_obtain_pair'),
     path('api/token/refresh/', AdminTokenRefreshView.as_view(), name='token_refresh'),

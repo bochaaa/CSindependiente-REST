@@ -1,7 +1,10 @@
-﻿.venv/`n__pycache__/`n*.pyc`ndb.sqlite3`n*.log`n.env
+﻿db.sqlite3
+.venv/`n__pycache__/`n*.pyc`ndb.sqlite3`n*.log`n.env
 AGENTS.md
 docs/business_rules.md
 .env.production.example
 .env
 firebase-service-account*.json
 *firebase*service*account*.json
+db.sqlite3
+
