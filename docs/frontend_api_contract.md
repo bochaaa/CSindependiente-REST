@@ -97,6 +97,10 @@ Response 200:
 - `DELETE /api/recurring-rules/{id}/`
 - `PATCH /api/recurring-rules/{id}/deactivate/`
 - `POST /api/recurring-rules/generate/?days_ahead=90`
+- `GET /api/notification-devices/`
+- `POST /api/notification-devices/`
+- `DELETE /api/notification-devices/{id}/`
+- `POST /api/notification-devices/unregister/`
 
 ## 4) Payloads clave
 
@@ -217,6 +221,87 @@ Campos opcionales en `unavailable_ranges`:
 - `class_title`: se informa cuando el tramo ocupado corresponde a clase.
 - `block_reason`: se informa cuando el tramo ocupado corresponde a bloqueo.
 
+## 4.5 Registrar dispositivo para notificaciones (admin)
+
+El frontend debe llamar este endpoint cuando un admin activa notificaciones o cuando Firebase/Capacitor entrega un token nuevo.
+
+`POST /api/notification-devices/`
+
+Headers:
+
+- `Authorization: Bearer <access_token>`
+
+Request web PWA:
+
+```json
+{
+  "platform": "web",
+  "provider": "fcm",
+  "token": "TOKEN_FCM_WEB",
+  "device_id": "browser-opcional"
+}
+```
+
+Request Android Capacitor:
+
+```json
+{
+  "platform": "android",
+  "provider": "fcm",
+  "token": "TOKEN_FCM_ANDROID",
+  "device_id": "android-device-id-opcional"
+}
+```
+
+Response 201:
+
+```json
+{
+  "id": 7,
+  "user_id": 12,
+  "platform": "web",
+  "provider": "fcm",
+  "token": "TOKEN_FCM_WEB",
+  "device_id": "browser-opcional",
+  "enabled": true,
+  "last_seen": "2026-06-29T10:30:00-03:00",
+  "created_at": "2026-06-29T10:30:00-03:00",
+  "updated_at": "2026-06-29T10:30:00-03:00"
+}
+```
+
+El endpoint es idempotente por `token`: si el mismo token se registra otra vez, actualiza `platform`, `device_id`, `user`, `enabled=true` y `last_seen`.
+
+Para logout o baja de permisos:
+
+`POST /api/notification-devices/unregister/`
+
+```json
+{
+  "token": "TOKEN_FCM_WEB"
+}
+```
+
+Alternativa por id:
+
+`DELETE /api/notification-devices/{id}/`
+
+Ambos desactivan el dispositivo (`enabled=false`), no lo borran fisicamente.
+
+Payload previsto para push cuando se crea una reserva:
+
+```json
+{
+  "title": "Nueva reserva",
+  "body": "Cancha 2 - 18:00 hs",
+  "data": {
+    "type": "reservation_created",
+    "reservation_id": "123",
+    "url": "/admin/reservations?date=2026-06-29"
+  }
+}
+```
+
 ## 5) Reglas de negocio vigentes
 
 ## 5.1 Duracion y tipos
@@ -269,7 +354,10 @@ Campos opcionales en `unavailable_ranges`:
 
 ## 5.7 Notificaciones
 
-- Se crea `NotificationLog` placeholder al crear reserva.
+- El admin registra tokens FCM con `POST /api/notification-devices/`.
+- Al crear una reserva normal, backend crea `NotificationLog` `PUSH` pendiente para cada dispositivo activo de admins.
+- Si `PUSH_NOTIFICATIONS_ENABLED=True` y Firebase esta configurado en backend, el backend envia el push real por FCM y marca el log como `SENT`.
+- Si Firebase no esta configurado, el log queda como `PENDING` o `FAILED` segun la configuracion, sin romper la creacion de la reserva.
 - No hay envio real de WhatsApp/email en esta etapa.
 
 ## 6) Enums utiles para frontend
@@ -281,3 +369,5 @@ Campos opcionales en `unavailable_ranges`:
 - `cancellation_request_status`: `PENDING`, `APPROVED`, `REJECTED`
 - `block_type`: `TOURNAMENT`, `MAINTENANCE`, `OTHER`
 - `day_of_week`: `MONDAY`, `TUESDAY`, `WEDNESDAY`, `THURSDAY`, `FRIDAY`, `SATURDAY`, `SUNDAY`
+- `notification_platform`: `web`, `android`
+- `notification_provider`: `fcm`

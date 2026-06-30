@@ -2,3 +2,6 @@
 AGENTS.md
 docs/business_rules.md
 .env.production.example
+.env
+firebase-service-account*.json
+*firebase*service*account*.json

@@ -5,6 +5,7 @@ django-cors-headers==4.4.0
 djangorestframework==3.17.1
 djangorestframework_simplejwt==5.4.0
 drf-spectacular==0.28.0
+firebase-admin>=6.5,<7
 inflection==0.5.1
 jsonschema==4.26.0
 jsonschema-specifications==2025.9.1

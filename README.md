@@ -36,6 +36,65 @@ python -m venv .venv
 .\.venv\Scripts\python.exe manage.py migrate
 ```
 
+### Cron diario en produccion
+
+El proyecto incluye un ejemplo en `deploy/cron/csitenis.cron.example`.
+Sirve para mantener generadas las clases recurrentes de los proximos 90 dias.
+No vence ni cancela reservas pendientes de pago.
+
+En el servidor:
+
+```bash
+sudo cp deploy/cron/csitenis.cron.example /etc/cron.d/csitenis
+sudo nano /etc/cron.d/csitenis
+sudo systemctl reload cron
+```
+
+Editar el archivo copiado y reemplazar:
+
+- `APP_DIR` por la ruta absoluta del backend.
+- `APP_USER` por el usuario Linux que ejecuta la app.
+
+Ejemplo de linea final:
+
+```cron
+0 3 * * * ubuntu cd /var/www/csitenis/backend && /var/www/csitenis/backend/.venv/bin/python manage.py run_scheduled_tasks --days-ahead=90 >> /var/log/csitenis_scheduled_tasks.log 2>&1
+```
+
+### Firebase Cloud Messaging
+
+Para que las notificaciones push lleguen realmente a navegador/PWA o Android:
+
+1. Crear un proyecto en Firebase.
+2. Descargar el service account JSON desde Firebase/Google Cloud.
+3. Copiar ese JSON en el servidor fuera del repo, por ejemplo:
+
+```bash
+/etc/csitenis/firebase-service-account.json
+```
+
+4. Configurar variables en `.env` de produccion:
+
+```env
+PUSH_NOTIFICATIONS_ENABLED=True
+FIREBASE_CREDENTIALS_PATH=/etc/csitenis/firebase-service-account.json
+```
+
+Alternativa sin archivo:
+
+```env
+PUSH_NOTIFICATIONS_ENABLED=True
+FIREBASE_CREDENTIALS_JSON={"type":"service_account", "...":"..."}
+```
+
+No subir el JSON privado al repositorio.
+
+Si quedan push pendientes, se pueden reenviar manualmente:
+
+```bash
+python manage.py send_pending_push_notifications --limit=100
+```
+
 ## Documentacion API (Swagger)
 
 - OpenAPI schema: `http://127.0.0.1:8000/api/schema/`

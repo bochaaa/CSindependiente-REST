@@ -8,7 +8,9 @@ from .models import (
     ClubSchedule,
     Court,
     DayOfWeek,
+    NotificationDevice,
     NotificationLog,
+    PaymentTransaction,
     PriceRule,
     RecurringReservationRule,
     Reservation,
@@ -79,6 +81,8 @@ class ReservationAdmin(admin.ModelAdmin):
         "reservation_type",
         "status",
         "is_paid",
+        "payment_status",
+        "paid_amount",
         "paid_at",
         "paid_confirmed_by",
         "contact_name",
@@ -86,7 +90,7 @@ class ReservationAdmin(admin.ModelAdmin):
         "start_datetime",
         "end_datetime",
     )
-    list_filter = ("status", "reservation_type", "court", "is_paid")
+    list_filter = ("status", "payment_status", "reservation_type", "court", "is_paid")
     search_fields = ("contact_name", "title", "contact_phone", "court__name")
     ordering = ("-start_datetime",)
     readonly_fields = ("created_at", "updated_at", "cancelled_at", "paid_at")
@@ -143,4 +147,40 @@ class PriceRuleAdmin(admin.ModelAdmin):
 admin.site.register(ReservationPlayer)
 admin.site.register(BlockedSlot)
 admin.site.register(CancellationRequest)
-admin.site.register(NotificationLog)
+
+
+@admin.register(NotificationLog)
+class NotificationLogAdmin(admin.ModelAdmin):
+    list_display = ("id", "reservation", "channel", "destination", "status", "created_at")
+    list_filter = ("channel", "status")
+    search_fields = ("destination", "reservation__contact_name")
+    readonly_fields = ("created_at", "updated_at")
+
+
+@admin.register(NotificationDevice)
+class NotificationDeviceAdmin(admin.ModelAdmin):
+    list_display = ("id", "user", "platform", "provider", "enabled", "last_seen", "updated_at")
+    list_filter = ("platform", "provider", "enabled")
+    search_fields = ("user__username", "token", "device_id")
+    readonly_fields = ("created_at", "updated_at", "last_seen")
+
+
+@admin.register(PaymentTransaction)
+class PaymentTransactionAdmin(admin.ModelAdmin):
+    list_display = (
+        "id",
+        "reservation",
+        "player",
+        "provider",
+        "payment_type",
+        "status",
+        "base_amount",
+        "mp_amount",
+        "amount_received",
+        "payment_id",
+        "external_reference",
+        "paid_at",
+    )
+    list_filter = ("provider", "payment_type", "status")
+    search_fields = ("external_reference", "payment_id", "preference_id", "reservation__contact_name")
+    readonly_fields = ("created_at", "updated_at", "paid_at")

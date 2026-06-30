@@ -1,0 +1,18 @@
+# CSI Tenis scheduled tasks
+#
+# Install example:
+#   sudo cp deploy/cron/csitenis.cron.example /etc/cron.d/csitenis
+#   sudo nano /etc/cron.d/csitenis
+#   sudo systemctl reload cron
+#
+# Replace:
+#   APP_DIR with the absolute backend path on the server.
+#   APP_USER with the Linux user that owns/runs the Django app.
+#
+# This keeps recurring class reservations generated for the next 90 days.
+# It does not expire or cancel unpaid reservations.
+
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+0 3 * * * APP_USER cd APP_DIR && APP_DIR/.venv/bin/python manage.py run_scheduled_tasks --days-ahead=90 >> /var/log/csitenis_scheduled_tasks.log 2>&1

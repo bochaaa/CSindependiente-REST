@@ -45,6 +45,24 @@ def env_bool(name: str, default: bool) -> bool:
     return value.strip().lower() in ("1", "true", "yes", "on")
 
 
+def env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise ImproperlyConfigured(f"{name} must be an integer.") from exc
+
+
+def env_str(name: str, default: str) -> str:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    value = value.strip()
+    return value or default
+
+
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = env_bool("DJANGO_DEBUG", True)
 
@@ -55,7 +73,7 @@ if not DEBUG and SECRET_KEY == "django-insecure-dev-only-change-me":
 
 ALLOWED_HOSTS = [
     host.strip()
-    for host in os.getenv("DJANGO_ALLOWED_HOSTS", "127.0.0.1,localhost").split(",")
+    for host in os.getenv("DJANGO_ALLOWED_HOSTS", "127.0.0.1,localhost,remold-safari-siesta.ngrok-free.dev").split(",")
     if host.strip()
 ]
 
@@ -185,6 +203,8 @@ REST_FRAMEWORK = {
         'public_availability': '20/min',
         'public_reservation_create': '20/min',
         'public_reservation_cancellation_request': '20/min',
+        'public_reservation_payment_search': '20/min',
+        'public_cash_payment_confirmation': '10/min',
         'auth_token_obtain': '10/min',
         'auth_token_refresh': '10/min',
     },
@@ -218,3 +238,16 @@ CSRF_TRUSTED_ORIGINS = [
     for origin in os.getenv("DJANGO_CSRF_TRUSTED_ORIGINS", DEFAULT_CORS_ORIGINS).split(",")
     if origin.strip()
 ]
+
+MP_ACCESS_TOKEN = env_str("MP_ACCESS_TOKEN", "")
+MP_PUBLIC_KEY = env_str("MP_PUBLIC_KEY", "")
+MP_WEBHOOK_URL = env_str("MP_WEBHOOK_URL", "https://sporturnos.com.ar/api/payments/webhook/")
+FRONTEND_SUCCESS_URL = env_str("FRONTEND_SUCCESS_URL", "https://sporturnos.com.ar/pago/success")
+FRONTEND_FAILURE_URL = env_str("FRONTEND_FAILURE_URL", "https://sporturnos.com.ar/pago/failure")
+FRONTEND_PENDING_URL = env_str("FRONTEND_PENDING_URL", "https://sporturnos.com.ar/pago/pending")
+PAYMENT_EXPIRATION_MINUTES = env_int("PAYMENT_EXPIRATION_MINUTES", 60)
+MP_IDENTIFICATION_DECIMAL = env_str("MP_IDENTIFICATION_DECIMAL", "0.19")
+CASH_PAYMENT_CONFIRMATION_PASSWORD = env_str("CASH_PAYMENT_CONFIRMATION_PASSWORD", "")
+PUSH_NOTIFICATIONS_ENABLED = env_bool("PUSH_NOTIFICATIONS_ENABLED", False)
+FIREBASE_CREDENTIALS_PATH = env_str("FIREBASE_CREDENTIALS_PATH", "")
+FIREBASE_CREDENTIALS_JSON = env_str("FIREBASE_CREDENTIALS_JSON", "")

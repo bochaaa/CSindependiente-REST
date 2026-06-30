@@ -1,6 +1,9 @@
 from datetime import date
+import csv
+import logging
 
 from django.contrib.auth import get_user_model
+from django.http import HttpResponse
 from django.db.models import Prefetch
 from django.db import OperationalError, transaction
 from drf_spectacular.utils import OpenApiParameter, OpenApiResponse, extend_schema, extend_schema_view
@@ -19,6 +22,7 @@ from .models import (
     CancellationRequest,
     ClubSchedule,
     Court,
+    NotificationDevice,
     PriceRule,
     RecurringReservationRule,
     Reservation,
@@ -31,13 +35,22 @@ from .serializers import (
     AuthUserSerializer,
     BlockedSlotSerializer,
     CancelReservationSerializer,
+    CashPaymentCreateSerializer,
     CancellationRequestCreateSerializer,
     CancellationRequestResolveSerializer,
     CancellationRequestSerializer,
     ClubScheduleSerializer,
     CourtSerializer,
     GenerateRecurringReservationsResponseSerializer,
+    MercadoPagoReportQuerySerializer,
+    NotificationDeviceSerializer,
+    NotificationDeviceUnregisterSerializer,
     PriceRuleSerializer,
+    PlayerReservationPaymentSearchSerializer,
+    ReservationPaymentSearchResultSerializer,
+    ReservationPaymentLinkCreateSerializer,
+    ReservationPaymentLinkResponseSerializer,
+    ReservationPaymentStatusDetailSerializer,
     ReservationPaymentStatusSerializer,
     RecurringRuleDeactivateResponseSerializer,
     RecurringRuleDeactivateSerializer,
@@ -50,12 +63,18 @@ from .services import (
     cancel_reservation_by_admin,
     deactivate_recurring_rule,
     ensure_recurring_rule_generation,
+    extract_mercadopago_payment_id,
+    build_payment_report_rows,
     generate_availability_for_date,
     generate_recurring_reservations,
+    get_today_pending_payment_reservations,
+    process_mercadopago_webhook_payment,
+    search_payable_reservations_by_player_name,
     set_reservation_payment_status,
 )
 
 User = get_user_model()
+logger = logging.getLogger(__name__)
 
 
 class RecurringGenerationUnavailable(APIException):
@@ -75,6 +94,49 @@ class CourtViewSet(viewsets.ModelViewSet):
     queryset = Court.objects.all().order_by("name")
     serializer_class = CourtSerializer
     permission_classes = (IsAdminOrReadOnly,)
+
+
+@extend_schema_view(
+    list=extend_schema(description="List current admin notification devices."),
+    create=extend_schema(description="Register or refresh a notification device token. Admin only."),
+    destroy=extend_schema(description="Disable a notification device. Admin only."),
+)
+class NotificationDeviceViewSet(
+    mixins.ListModelMixin,
+    mixins.CreateModelMixin,
+    mixins.DestroyModelMixin,
+    viewsets.GenericViewSet,
+):
+    serializer_class = NotificationDeviceSerializer
+    permission_classes = (IsAdminUser,)
+
+    def get_queryset(self):
+        return NotificationDevice.objects.filter(user=self.request.user).order_by("-last_seen", "-updated_at")
+
+    def destroy(self, request, *args, **kwargs):
+        device = self.get_object()
+        device.enabled = False
+        device.save(update_fields=("enabled", "updated_at"))
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    @extend_schema(
+        description="Disable a notification device by token or device_id. Admin only.",
+        request=NotificationDeviceUnregisterSerializer,
+        responses={200: OpenApiResponse(description="Device disabled count.")},
+    )
+    @action(detail=False, methods=("post",), url_path="unregister")
+    def unregister(self, request):
+        serializer = NotificationDeviceUnregisterSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        queryset = self.get_queryset().filter(enabled=True)
+        token = serializer.validated_data.get("token")
+        device_id = serializer.validated_data.get("device_id")
+        if token:
+            queryset = queryset.filter(token=token)
+        else:
+            queryset = queryset.filter(device_id=device_id)
+        disabled_count = queryset.update(enabled=False)
+        return Response({"disabled": disabled_count})
 
 
 @extend_schema_view(
@@ -170,13 +232,22 @@ class ReservationViewSet(
     viewsets.GenericViewSet,
 ):
     queryset = Reservation.objects.select_related("court", "recurring_rule").prefetch_related(
-        Prefetch("players", queryset=ReservationPlayer.objects.order_by("id"))
+        Prefetch("players", queryset=ReservationPlayer.objects.order_by("id")),
+        "payment_transactions",
     )
 
     throttle_classes = (ScopedRateThrottle,)
 
     def get_permissions(self):
-        if self.action in ("create", "request_cancellation"):
+        if self.action in (
+            "create",
+            "request_cancellation",
+            "create_payment_link",
+            "confirm_cash_payment",
+            "payment_status",
+            "pending_payments_today",
+            "search_payments_by_player",
+        ):
             return [AllowAny()]
         if self.action in ("cancel", "mark_payment", "list", "retrieve"):
             return [IsAdminUser()]
@@ -187,6 +258,10 @@ class ReservationViewSet(
             self.throttle_scope = "public_reservation_create"
         elif self.action == "request_cancellation":
             self.throttle_scope = "public_reservation_cancellation_request"
+        elif self.action in ("pending_payments_today", "search_payments_by_player"):
+            self.throttle_scope = "public_reservation_payment_search"
+        elif self.action == "confirm_cash_payment":
+            self.throttle_scope = "public_cash_payment_confirmation"
         else:
             self.throttle_scope = None
         return super().get_throttles()
@@ -229,6 +304,14 @@ class ReservationViewSet(
     def get_serializer_class(self):
         if self.action == "create":
             return ReservationCreateSerializer
+        if self.action == "create_payment_link":
+            return ReservationPaymentLinkCreateSerializer
+        if self.action == "confirm_cash_payment":
+            return CashPaymentCreateSerializer
+        if self.action == "payment_status":
+            return ReservationPaymentStatusDetailSerializer
+        if self.action in ("pending_payments_today", "search_payments_by_player"):
+            return ReservationPaymentSearchResultSerializer
         return ReservationSerializer
 
     @extend_schema(
@@ -284,6 +367,114 @@ class ReservationViewSet(
         serializer.is_valid(raise_exception=True)
         serializer.save()
         return Response({"detail": "Cancellation request created."}, status=status.HTTP_201_CREATED)
+
+    @extend_schema(
+        description=(
+            "Create a Mercado Pago Checkout Pro link for a reservation. "
+            "Supports total, player and partial payments."
+        ),
+        request=ReservationPaymentLinkCreateSerializer,
+        responses={201: ReservationPaymentLinkResponseSerializer},
+    )
+    @action(detail=True, methods=("post",), url_path="payments/create-link")
+    def create_payment_link(self, request, pk=None):
+        reservation = self.get_object()
+        serializer = ReservationPaymentLinkCreateSerializer(
+            data=request.data,
+            context={"reservation": reservation},
+        )
+        serializer.is_valid(raise_exception=True)
+        payment_transaction = serializer.save()
+        payment_transaction.reservation.refresh_from_db()
+        response_data = {
+            "reservation_id": payment_transaction.reservation_id,
+            "payment_transaction_id": payment_transaction.id,
+            "payment_url": payment_transaction.payment_url,
+            "preference_id": payment_transaction.preference_id,
+            "amount": payment_transaction.base_amount,
+            "mp_amount": payment_transaction.mp_amount,
+            "identification_decimal": payment_transaction.identification_decimal,
+            "reservation_total_amount": payment_transaction.reservation.total_price,
+            "reservation_paid_amount": payment_transaction.reservation.paid_amount,
+            "reservation_remaining_amount": payment_transaction.reservation.remaining_amount,
+            "expires_at": payment_transaction.expires_at,
+        }
+        response_serializer = ReservationPaymentLinkResponseSerializer(data=response_data)
+        response_serializer.is_valid(raise_exception=True)
+        return Response(response_serializer.data, status=status.HTTP_201_CREATED)
+
+    @extend_schema(
+        description=(
+            "Register a cash payment for a reservation using the shared confirmation password. "
+            "Creates an approved cash payment transaction and updates reservation payment state."
+        ),
+        request=CashPaymentCreateSerializer,
+        responses={201: ReservationSerializer},
+    )
+    @action(detail=True, methods=("post",), url_path="payments/cash")
+    def confirm_cash_payment(self, request, pk=None):
+        reservation = self.get_object()
+        serializer = CashPaymentCreateSerializer(
+            data=request.data,
+            context={"reservation": reservation, "request": request},
+        )
+        serializer.is_valid(raise_exception=True)
+        payment_transaction = serializer.save()
+        payment_transaction.reservation.refresh_from_db()
+        response_serializer = ReservationSerializer(payment_transaction.reservation)
+        return Response(response_serializer.data, status=status.HTTP_201_CREATED)
+
+    @extend_schema(
+        description="Return reservation payment state and related payment transactions. Public read endpoint.",
+        responses={200: ReservationPaymentStatusDetailSerializer},
+    )
+    @action(detail=True, methods=("get",), url_path="payment-status")
+    def payment_status(self, request, pk=None):
+        reservation = self.get_object()
+        serializer = ReservationPaymentStatusDetailSerializer(reservation)
+        return Response(serializer.data)
+
+    @extend_schema(
+        description=(
+            "Search future reservations with pending balance by participant first name, last name, "
+            "or full name. Public endpoint for players who need to find their reservation to pay."
+        ),
+        parameters=[
+            OpenApiParameter(
+                name="q",
+                type=str,
+                required=True,
+                location=OpenApiParameter.QUERY,
+                description="Player name search. Minimum 3 characters. Example: jose hernandez.",
+            )
+        ],
+        responses={200: ReservationPaymentSearchResultSerializer(many=True)},
+    )
+    @action(detail=False, methods=("get",), url_path="payments/search-by-player")
+    def search_payments_by_player(self, request):
+        query_serializer = PlayerReservationPaymentSearchSerializer(data=request.query_params)
+        query_serializer.is_valid(raise_exception=True)
+        query = query_serializer.validated_data["q"]
+        tokens = [token.strip().lower() for token in query.split() if token.strip()]
+        reservations = search_payable_reservations_by_player_name(query=query)
+        serializer = ReservationPaymentSearchResultSerializer(
+            reservations,
+            many=True,
+            context={"search_tokens": tokens},
+        )
+        return Response(serializer.data)
+
+    @extend_schema(
+        description=(
+            "List today's active reservations with pending balance. Public endpoint for the app payment tab."
+        ),
+        responses={200: ReservationPaymentSearchResultSerializer(many=True)},
+    )
+    @action(detail=False, methods=("get",), url_path="payments/pending-today")
+    def pending_payments_today(self, request):
+        reservations = get_today_pending_payment_reservations()
+        serializer = ReservationPaymentSearchResultSerializer(reservations, many=True)
+        return Response(serializer.data)
 
 
 @extend_schema_view(
@@ -448,6 +639,107 @@ class GenerateRecurringReservationsAPIView(APIView):
         serializer = self.serializer_class(data=response_data)
         serializer.is_valid(raise_exception=True)
         return Response(serializer.data)
+
+
+@extend_schema(
+    description="Mercado Pago webhook receiver. Always returns 200 to avoid unnecessary retries.",
+    request=None,
+    responses={200: OpenApiResponse(description="Webhook received.")},
+)
+class PaymentWebhookAPIView(APIView):
+    permission_classes = (AllowAny,)
+    authentication_classes = ()
+    throttle_classes = ()
+
+    def post(self, request):
+        payment_id = extract_mercadopago_payment_id(request)
+        if not payment_id:
+            logger.info("Mercado Pago webhook received without payment id.")
+            return Response({"detail": "No payment id found."}, status=status.HTTP_200_OK)
+        try:
+            process_mercadopago_webhook_payment(payment_id)
+        except Exception as exc:
+            logger.exception("Mercado Pago webhook processing failed for payment_id=%s", payment_id)
+            return Response({"detail": "Webhook received."}, status=status.HTTP_200_OK)
+        return Response({"detail": "Webhook received."}, status=status.HTTP_200_OK)
+
+
+@extend_schema(
+    description=(
+        "Export Mercado Pago payments as CSV for Rentas. Admin only. "
+        "By default includes approved payments by paid_at date range. Use status=all to export all attempts "
+        "created in the range."
+    ),
+    parameters=[
+        OpenApiParameter(
+            name="start_date",
+            type=str,
+            required=True,
+            location=OpenApiParameter.QUERY,
+            description="Start date in YYYY-MM-DD format.",
+        ),
+        OpenApiParameter(
+            name="end_date",
+            type=str,
+            required=True,
+            location=OpenApiParameter.QUERY,
+            description="End date in YYYY-MM-DD format.",
+        ),
+        OpenApiParameter(
+            name="status",
+            type=str,
+            required=False,
+            location=OpenApiParameter.QUERY,
+            description="approved (default) or all.",
+        ),
+    ],
+    responses={200: OpenApiResponse(description="CSV file.")},
+)
+class MercadoPagoReportCSVAPIView(APIView):
+    permission_classes = (IsAdminUser,)
+
+    fieldnames = (
+        "fecha_pago",
+        "hora_pago",
+        "reserva_id",
+        "cancha",
+        "turno_fecha",
+        "turno_inicio",
+        "turno_fin",
+        "jugador",
+        "metodo_pago",
+        "tipo_pago",
+        "estado",
+        "detalle_estado",
+        "monto_reserva",
+        "decimal_identificador",
+        "monto_cobrado_mp",
+        "monto_informado_mp",
+        "nro_operacion_mp",
+        "preference_id",
+        "external_reference",
+        "payer_email",
+    )
+
+    def get(self, request):
+        query_serializer = MercadoPagoReportQuerySerializer(data=request.query_params)
+        query_serializer.is_valid(raise_exception=True)
+        start_date = query_serializer.validated_data["start_date"]
+        end_date = query_serializer.validated_data["end_date"]
+        status_filter = query_serializer.validated_data["status"]
+        rows = build_payment_report_rows(
+            start_date=start_date,
+            end_date=end_date,
+            status_filter=status_filter,
+        )
+
+        filename = f"mercadopago-tenis-{start_date.isoformat()}-{end_date.isoformat()}.csv"
+        response = HttpResponse(content_type="text/csv; charset=utf-8")
+        response["Content-Disposition"] = f'attachment; filename="{filename}"'
+        writer = csv.DictWriter(response, fieldnames=self.fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+        return response
 
 
 @extend_schema(

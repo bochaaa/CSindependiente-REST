@@ -8,6 +8,9 @@ from .views import (
     ClubScheduleViewSet,
     CourtViewSet,
     GenerateRecurringReservationsAPIView,
+    MercadoPagoReportCSVAPIView,
+    NotificationDeviceViewSet,
+    PaymentWebhookAPIView,
     PriceRuleViewSet,
     RecurringReservationRuleViewSet,
     ReservationViewSet,
@@ -16,6 +19,7 @@ from .views import (
 
 router = DefaultRouter()
 router.register("courts", CourtViewSet, basename="court")
+router.register("notification-devices", NotificationDeviceViewSet, basename="notification-device")
 router.register("prices", PriceRuleViewSet, basename="price")
 router.register("schedules", ClubScheduleViewSet, basename="schedule")
 router.register("special-schedules", SpecialScheduleViewSet, basename="special-schedule")
@@ -31,5 +35,11 @@ urlpatterns = [
         "recurring-rules/generate/",
         GenerateRecurringReservationsAPIView.as_view(),
         name="generate-recurring-reservations",
+    ),
+    path("payments/webhook/", PaymentWebhookAPIView.as_view(), name="payment-webhook"),
+    path(
+        "payments/reports/mercadopago.csv/",
+        MercadoPagoReportCSVAPIView.as_view(),
+        name="mercadopago-report-csv",
     ),
 ]

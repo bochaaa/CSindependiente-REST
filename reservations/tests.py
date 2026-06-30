@@ -1,10 +1,15 @@
 from datetime import datetime, time, timedelta
 from decimal import Decimal
+import csv
+import os
+from io import StringIO
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.core.cache import cache
 from django.core.management import call_command
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
 from rest_framework import status
@@ -17,16 +22,27 @@ from .models import (
     ClubSchedule,
     DayOfWeek,
     GameMode,
+    NotificationChannel,
+    NotificationDevice,
+    NotificationLog,
+    NotificationProvider,
+    NotificationStatus,
+    PaymentProvider,
+    PaymentTransaction,
+    PaymentTransactionStatus,
+    PaymentType,
     PlayerType,
     PriceRule,
     RecurringReservationRule,
     Reservation,
+    ReservationPaymentStatus,
     ReservationStatus,
     ReservationType,
     SpecialSchedule,
     Court,
 )
-from .services import generate_recurring_reservations
+from .push_notifications import InvalidPushTokenError
+from .services import generate_recurring_reservations, send_pending_push_notifications
 
 
 class ReservationBusinessRulesTests(APITestCase):
@@ -122,6 +138,161 @@ class ReservationBusinessRulesTests(APITestCase):
         reservation = Reservation.objects.get(id=response.data["id"])
         self.assertEqual(reservation.players.count(), 2)
         self.assertEqual(reservation.players.first().price_applied, Decimal("4000.00"))
+        self.assertIsNone(reservation.payment_expires_at)
+
+    def test_reservation_creation_queues_push_notifications_for_admin_devices(self):
+        NotificationDevice.objects.create(
+            user=self.admin,
+            platform="web",
+            provider=NotificationProvider.FCM,
+            token="admin-web-token",
+            enabled=True,
+        )
+        NotificationDevice.objects.create(
+            user=self.admin,
+            platform="android",
+            provider=NotificationProvider.FCM,
+            token="disabled-admin-token",
+            enabled=False,
+        )
+        NotificationDevice.objects.create(
+            user=self.normal_user,
+            platform="web",
+            provider=NotificationProvider.FCM,
+            token="non-admin-token",
+            enabled=True,
+        )
+
+        response = self.client.post(reverse("reservation-list"), self._reservation_payload(), format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        reservation = Reservation.objects.get(id=response.data["id"])
+        push_logs = NotificationLog.objects.filter(
+            reservation=reservation,
+            channel=NotificationChannel.PUSH,
+        )
+        self.assertEqual(push_logs.count(), 1)
+        push_log = push_logs.get()
+        self.assertEqual(push_log.destination, "admin-web-token")
+        self.assertEqual(push_log.payload["title"], "Nueva reserva")
+        self.assertEqual(push_log.payload["data"]["type"], "reservation_created")
+        self.assertEqual(push_log.payload["data"]["reservation_id"], str(reservation.id))
+
+    def test_admin_can_register_and_unregister_notification_device(self):
+        self.client.force_authenticate(user=self.admin)
+
+        response = self.client.post(
+            reverse("notification-device-list"),
+            {
+                "platform": "web",
+                "provider": NotificationProvider.FCM,
+                "token": "fcm-token-1",
+                "device_id": "browser-1",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        device = NotificationDevice.objects.get(token="fcm-token-1")
+        self.assertEqual(device.user, self.admin)
+        self.assertTrue(device.enabled)
+        self.assertIsNotNone(device.last_seen)
+
+        refresh_response = self.client.post(
+            reverse("notification-device-list"),
+            {
+                "platform": "android",
+                "provider": NotificationProvider.FCM,
+                "token": "fcm-token-1",
+                "device_id": "phone-1",
+            },
+            format="json",
+        )
+        device.refresh_from_db()
+        self.assertEqual(refresh_response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(NotificationDevice.objects.count(), 1)
+        self.assertEqual(device.platform, "android")
+        self.assertEqual(device.device_id, "phone-1")
+
+        unregister_response = self.client.post(
+            reverse("notification-device-unregister"),
+            {"token": "fcm-token-1"},
+            format="json",
+        )
+
+        self.assertEqual(unregister_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(unregister_response.data["disabled"], 1)
+        device.refresh_from_db()
+        self.assertFalse(device.enabled)
+
+    def test_non_admin_cannot_register_notification_device(self):
+        self.client.force_authenticate(user=self.normal_user)
+
+        response = self.client.post(
+            reverse("notification-device-list"),
+            {
+                "platform": "web",
+                "provider": NotificationProvider.FCM,
+                "token": "fcm-token-1",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_pending_push_notifications_are_sent_when_firebase_is_enabled(self):
+        NotificationDevice.objects.create(
+            user=self.admin,
+            platform="web",
+            provider=NotificationProvider.FCM,
+            token="admin-web-token",
+            enabled=True,
+        )
+        response = self.client.post(reverse("reservation-list"), self._reservation_payload(), format="json")
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        push_log = NotificationLog.objects.get(channel=NotificationChannel.PUSH)
+        self.assertEqual(push_log.status, NotificationStatus.PENDING)
+
+        with (
+            override_settings(PUSH_NOTIFICATIONS_ENABLED=True),
+            patch("reservations.services.send_firebase_push", return_value="fcm-message-id") as send_mock,
+        ):
+            result = send_pending_push_notifications(log_ids=[push_log.id])
+
+        self.assertEqual(result, {"sent": 1, "failed": 0, "skipped": 0})
+        push_log.refresh_from_db()
+        self.assertEqual(push_log.status, NotificationStatus.SENT)
+        send_mock.assert_called_once_with(
+            token="admin-web-token",
+            payload=push_log.payload,
+        )
+
+    def test_invalid_push_token_marks_log_failed_and_disables_device(self):
+        device = NotificationDevice.objects.create(
+            user=self.admin,
+            platform="web",
+            provider=NotificationProvider.FCM,
+            token="invalid-admin-token",
+            enabled=True,
+        )
+        response = self.client.post(reverse("reservation-list"), self._reservation_payload(), format="json")
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        push_log = NotificationLog.objects.get(channel=NotificationChannel.PUSH)
+
+        with (
+            override_settings(PUSH_NOTIFICATIONS_ENABLED=True),
+            patch(
+                "reservations.services.send_firebase_push",
+                side_effect=InvalidPushTokenError("Token no registrado."),
+            ),
+        ):
+            result = send_pending_push_notifications(log_ids=[push_log.id])
+
+        self.assertEqual(result, {"sent": 0, "failed": 1, "skipped": 0})
+        push_log.refresh_from_db()
+        device.refresh_from_db()
+        self.assertEqual(push_log.status, NotificationStatus.FAILED)
+        self.assertFalse(device.enabled)
 
     def test_create_valid_doubles_reservation(self):
         players = [
@@ -153,11 +324,30 @@ class ReservationBusinessRulesTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn("date", response.data)
 
-    def test_reject_reservation_already_started_today(self):
-        started_time = (timezone.localtime() - timedelta(minutes=10)).time().replace(microsecond=0)
-        payload = self._reservation_payload(target_date=timezone.localdate(), start_time=started_time.strftime("%H:%M"))
-        response = self.client.post(reverse("reservation-list"), payload, format="json")
+    def test_reject_same_day_reservation_with_less_than_three_hours_notice(self):
+        fixed_now = timezone.make_aware(
+            datetime.combine(timezone.localdate(), time(hour=10, minute=0)),
+            timezone.get_current_timezone(),
+        )
+        payload = self._reservation_payload(target_date=timezone.localdate(), start_time="12:00")
+
+        with patch("reservations.services.timezone.now", return_value=fixed_now):
+            response = self.client.post(reverse("reservation-list"), payload, format="json")
+
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("start_time", response.data)
+
+    def test_allow_same_day_reservation_with_three_hours_notice(self):
+        fixed_now = timezone.make_aware(
+            datetime.combine(timezone.localdate(), time(hour=10, minute=0)),
+            timezone.get_current_timezone(),
+        )
+        payload = self._reservation_payload(target_date=timezone.localdate(), start_time="13:00")
+
+        with patch("reservations.services.timezone.now", return_value=fixed_now):
+            response = self.client.post(reverse("reservation-list"), payload, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
 
     def test_reject_overlap_with_confirmed_reservation(self):
         response_1 = self.client.post(reverse("reservation-list"), self._reservation_payload(), format="json")
@@ -238,6 +428,10 @@ class ReservationBusinessRulesTests(APITestCase):
         self.assertTrue(reservation.is_paid)
         self.assertIsNotNone(reservation.paid_at)
         self.assertEqual(reservation.paid_confirmed_by_id, self.admin.id)
+        cash_transaction = PaymentTransaction.objects.get(reservation=reservation)
+        self.assertEqual(cash_transaction.provider, PaymentProvider.CASH)
+        self.assertEqual(cash_transaction.status, PaymentTransactionStatus.APPROVED)
+        self.assertEqual(cash_transaction.base_amount, reservation.total_price)
 
     def test_non_admin_cannot_confirm_reservation_payment(self):
         create_response = self.client.post(reverse("reservation-list"), self._reservation_payload(), format="json")
@@ -250,6 +444,438 @@ class ReservationBusinessRulesTests(APITestCase):
             format="json",
         )
         self.assertEqual(payment_response.status_code, status.HTTP_403_FORBIDDEN)
+
+    @override_settings(CASH_PAYMENT_CONFIRMATION_PASSWORD="cash-secret")
+    def test_cash_payment_password_confirms_reservation_and_creates_transaction(self):
+        create_response = self.client.post(reverse("reservation-list"), self._reservation_payload(), format="json")
+        reservation_id = create_response.data["id"]
+
+        response = self.client.post(
+            reverse("reservation-confirm-cash-payment", args=[reservation_id]),
+            {"confirmation_password": "cash-secret", "notes": "Pago en caja"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertTrue(response.data["is_paid"])
+        self.assertEqual(response.data["payment_status"], ReservationPaymentStatus.PAID)
+        self.assertEqual(response.data["paid_amount"], "10000.00")
+        self.assertEqual(len(response.data["payment_transactions"]), 1)
+        self.assertEqual(response.data["payment_transactions"][0]["provider"], PaymentProvider.CASH)
+
+        reservation = Reservation.objects.get(id=reservation_id)
+        cash_transaction = PaymentTransaction.objects.get(reservation=reservation)
+        self.assertEqual(cash_transaction.provider, PaymentProvider.CASH)
+        self.assertEqual(cash_transaction.status, PaymentTransactionStatus.APPROVED)
+        self.assertEqual(cash_transaction.base_amount, reservation.total_price)
+        self.assertEqual(cash_transaction.identification_decimal, Decimal("0.00"))
+        self.assertEqual(cash_transaction.amount_received, reservation.total_price)
+
+    @override_settings(CASH_PAYMENT_CONFIRMATION_PASSWORD="cash-secret")
+    def test_cash_payment_requires_valid_password(self):
+        create_response = self.client.post(reverse("reservation-list"), self._reservation_payload(), format="json")
+        reservation_id = create_response.data["id"]
+
+        response = self.client.post(
+            reverse("reservation-confirm-cash-payment", args=[reservation_id]),
+            {"confirmation_password": "wrong"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(PaymentTransaction.objects.count(), 0)
+
+    @patch("reservations.services.mercadopago_service.create_checkout_preference_for_reservation_payment")
+    def test_create_total_payment_link_uses_checkout_pro_decimal_identifier(self, mocked_create_preference):
+        mocked_create_preference.return_value = {
+            "id": "pref_total_1",
+            "init_point": "https://mercadopago.example/checkout/total",
+        }
+        create_response = self.client.post(reverse("reservation-list"), self._reservation_payload(), format="json")
+        reservation_id = create_response.data["id"]
+
+        response = self.client.post(
+            reverse("reservation-create-payment-link", args=[reservation_id]),
+            {"amount": "10000.00", "payment_type": PaymentType.TOTAL},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data["amount"], "10000.00")
+        self.assertEqual(response.data["mp_amount"], "10000.19")
+        payment_transaction = PaymentTransaction.objects.get(id=response.data["payment_transaction_id"])
+        self.assertEqual(payment_transaction.status, PaymentTransactionStatus.PENDING)
+        self.assertEqual(payment_transaction.base_amount, Decimal("10000.00"))
+        self.assertEqual(payment_transaction.identification_decimal, Decimal("0.19"))
+        self.assertEqual(payment_transaction.mp_amount, Decimal("10000.19"))
+        self.assertTrue(payment_transaction.external_reference.startswith(f"TENIS-RESERVA-{reservation_id}-TOTAL"))
+
+        preference_transaction = mocked_create_preference.call_args.args[0]
+        self.assertEqual(preference_transaction.id, payment_transaction.id)
+
+    @patch("reservations.services.mercadopago_service.create_checkout_preference_for_reservation_payment")
+    def test_create_player_payment_link_tracks_player(self, mocked_create_preference):
+        mocked_create_preference.return_value = {
+            "id": "pref_player_1",
+            "init_point": "https://mercadopago.example/checkout/player",
+        }
+        create_response = self.client.post(reverse("reservation-list"), self._reservation_payload(), format="json")
+        reservation = Reservation.objects.get(id=create_response.data["id"])
+        player = reservation.players.order_by("id").first()
+
+        response = self.client.post(
+            reverse("reservation-create-payment-link", args=[reservation.id]),
+            {"amount": str(player.price_applied), "payment_type": PaymentType.PLAYER, "player_id": player.id},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        payment_transaction = PaymentTransaction.objects.get(id=response.data["payment_transaction_id"])
+        self.assertEqual(payment_transaction.player_id, player.id)
+        self.assertTrue(
+            payment_transaction.external_reference.startswith(
+                f"TENIS-RESERVA-{reservation.id}-JUGADOR-{player.id}"
+            )
+        )
+
+    @patch("reservations.services.mercadopago_service.get_payment")
+    @patch("reservations.services.mercadopago_service.create_checkout_preference_for_reservation_payment")
+    def test_webhook_approved_payment_updates_partial_and_paid_idempotently(
+        self,
+        mocked_create_preference,
+        mocked_get_payment,
+    ):
+        mocked_create_preference.side_effect = [
+            {"id": "pref_player_1", "init_point": "https://mercadopago.example/checkout/player-1"},
+            {"id": "pref_player_2", "init_point": "https://mercadopago.example/checkout/player-2"},
+        ]
+        create_response = self.client.post(reverse("reservation-list"), self._reservation_payload(), format="json")
+        reservation = Reservation.objects.get(id=create_response.data["id"])
+        first_player, second_player = list(reservation.players.order_by("id"))
+
+        first_link = self.client.post(
+            reverse("reservation-create-payment-link", args=[reservation.id]),
+            {
+                "amount": str(first_player.price_applied),
+                "payment_type": PaymentType.PLAYER,
+                "player_id": first_player.id,
+            },
+            format="json",
+        )
+        second_link = self.client.post(
+            reverse("reservation-create-payment-link", args=[reservation.id]),
+            {
+                "amount": str(second_player.price_applied),
+                "payment_type": PaymentType.PLAYER,
+                "player_id": second_player.id,
+            },
+            format="json",
+        )
+        first_transaction = PaymentTransaction.objects.get(id=first_link.data["payment_transaction_id"])
+        second_transaction = PaymentTransaction.objects.get(id=second_link.data["payment_transaction_id"])
+
+        mocked_get_payment.return_value = {
+            "id": "mp_payment_1",
+            "status": "approved",
+            "status_detail": "accredited",
+            "external_reference": first_transaction.external_reference,
+            "transaction_amount": str(first_transaction.mp_amount),
+            "payer": {"email": "player1@example.com"},
+        }
+        webhook_response = self.client.post(reverse("payment-webhook"), {"data": {"id": "mp_payment_1"}}, format="json")
+        self.assertEqual(webhook_response.status_code, status.HTTP_200_OK)
+        reservation.refresh_from_db()
+        self.assertEqual(reservation.paid_amount, first_player.price_applied)
+        self.assertEqual(reservation.payment_status, ReservationPaymentStatus.PARTIAL_PAYMENT)
+        self.assertFalse(reservation.is_paid)
+
+        duplicate_response = self.client.post(reverse("payment-webhook"), {"data": {"id": "mp_payment_1"}}, format="json")
+        self.assertEqual(duplicate_response.status_code, status.HTTP_200_OK)
+        reservation.refresh_from_db()
+        self.assertEqual(reservation.paid_amount, first_player.price_applied)
+
+        mocked_get_payment.return_value = {
+            "id": "mp_payment_2",
+            "status": "approved",
+            "status_detail": "accredited",
+            "external_reference": second_transaction.external_reference,
+            "transaction_amount": str(second_transaction.mp_amount),
+            "payer": {"email": "player2@example.com"},
+        }
+        self.client.post(reverse("payment-webhook"), {"data": {"id": "mp_payment_2"}}, format="json")
+        reservation.refresh_from_db()
+        self.assertEqual(reservation.paid_amount, reservation.total_price)
+        self.assertEqual(reservation.payment_status, ReservationPaymentStatus.PAID)
+        self.assertTrue(reservation.is_paid)
+        self.assertIsNotNone(reservation.paid_at)
+
+    def test_payment_status_endpoint_returns_players_and_transactions(self):
+        create_response = self.client.post(reverse("reservation-list"), self._reservation_payload(), format="json")
+        reservation = Reservation.objects.get(id=create_response.data["id"])
+        PaymentTransaction.objects.create(
+            reservation=reservation,
+            payment_type=PaymentType.TOTAL,
+            external_reference=f"TENIS-RESERVA-{reservation.id}-TOTAL-test",
+            base_amount=reservation.total_price,
+            identification_decimal=Decimal("0.19"),
+            mp_amount=reservation.total_price + Decimal("0.19"),
+        )
+
+        response = self.client.get(reverse("reservation-payment-status", args=[reservation.id]))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["id"], reservation.id)
+        self.assertEqual(response.data["total_amount"], "10000.00")
+        self.assertEqual(response.data["remaining_amount"], "10000.00")
+        self.assertEqual(len(response.data["players"]), 2)
+        self.assertEqual(len(response.data["payment_transactions"]), 1)
+
+    def test_search_payable_reservations_by_player_full_name(self):
+        payable_players = [
+            {"first_name": "Jose", "last_name": "Hernandez", "is_member": True},
+            {"first_name": "Santi", "last_name": "Fernandez", "is_member": False},
+        ]
+        payable_response = self.client.post(
+            reverse("reservation-list"),
+            self._reservation_payload(players=payable_players),
+            format="json",
+        )
+        payable_reservation_id = payable_response.data["id"]
+
+        paid_response = self.client.post(
+            reverse("reservation-list"),
+            self._reservation_payload(start_time="20:00", players=payable_players),
+            format="json",
+        )
+        paid_reservation = Reservation.objects.get(id=paid_response.data["id"])
+        paid_reservation.payment_status = ReservationPaymentStatus.PAID
+        paid_reservation.is_paid = True
+        paid_reservation.paid_amount = paid_reservation.total_price
+        paid_reservation.save(update_fields=("payment_status", "is_paid", "paid_amount", "updated_at"))
+
+        expired_response = self.client.post(
+            reverse("reservation-list"),
+            self._reservation_payload(start_time="21:30", players=payable_players),
+            format="json",
+        )
+        expired_reservation = Reservation.objects.get(id=expired_response.data["id"])
+        expired_reservation.payment_status = ReservationPaymentStatus.EXPIRED
+        expired_reservation.save(update_fields=("payment_status", "updated_at"))
+
+        response = self.client.get(
+            reverse("reservation-search-payments-by-player"),
+            {"q": "jose hernandez"},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["id"], payable_reservation_id)
+        self.assertEqual(response.data[0]["remaining_amount"], "10000.00")
+        self.assertEqual(len(response.data[0]["matching_players"]), 1)
+        self.assertEqual(response.data[0]["matching_players"][0]["first_name"], "Jose")
+
+    def test_search_payable_reservations_requires_minimum_query_length(self):
+        response = self.client.get(
+            reverse("reservation-search-payments-by-player"),
+            {"q": "jo"},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("q", response.data)
+
+    def test_public_can_list_today_pending_payment_reservations(self):
+        today = timezone.localdate()
+        fixed_now = timezone.make_aware(
+            datetime.combine(today, time(hour=8, minute=0)),
+            timezone.get_current_timezone(),
+        )
+        with patch("reservations.services.timezone.now", return_value=fixed_now):
+            pending_response = self.client.post(
+                reverse("reservation-list"),
+                self._reservation_payload(target_date=today, start_time="11:00"),
+                format="json",
+            )
+            paid_response = self.client.post(
+                reverse("reservation-list"),
+                self._reservation_payload(target_date=today, start_time="13:00"),
+                format="json",
+            )
+        self.assertEqual(pending_response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(paid_response.status_code, status.HTTP_201_CREATED)
+        paid_reservation = Reservation.objects.get(id=paid_response.data["id"])
+        paid_reservation.payment_status = ReservationPaymentStatus.PAID
+        paid_reservation.is_paid = True
+        paid_reservation.paid_amount = paid_reservation.total_price
+        paid_reservation.save(update_fields=("payment_status", "is_paid", "paid_amount", "updated_at"))
+        tomorrow_response = self.client.post(
+            reverse("reservation-list"),
+            self._reservation_payload(target_date=today + timedelta(days=1), start_time="11:00"),
+            format="json",
+        )
+        self.assertEqual(tomorrow_response.status_code, status.HTTP_201_CREATED)
+
+        response = self.client.get(reverse("reservation-pending-payments-today"))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["id"], pending_response.data["id"])
+        self.assertEqual(response.data[0]["remaining_amount"], "10000.00")
+        self.assertEqual(len(response.data[0]["players"]), 2)
+
+    def test_admin_can_export_mercadopago_monthly_report_csv(self):
+        create_response = self.client.post(reverse("reservation-list"), self._reservation_payload(), format="json")
+        reservation = Reservation.objects.get(id=create_response.data["id"])
+        player = reservation.players.order_by("id").first()
+        now = timezone.now()
+        approved_transaction = PaymentTransaction.objects.create(
+            reservation=reservation,
+            player=player,
+            payment_type=PaymentType.PLAYER,
+            preference_id="pref_approved",
+            payment_id="mp_approved_1",
+            external_reference=f"TENIS-RESERVA-{reservation.id}-JUGADOR-{player.id}-report",
+            status=PaymentTransactionStatus.APPROVED,
+            status_detail="accredited",
+            base_amount=player.price_applied,
+            identification_decimal=Decimal("0.19"),
+            mp_amount=player.price_applied + Decimal("0.19"),
+            amount_received=player.price_applied + Decimal("0.19"),
+            payer_email="jose@example.com",
+            paid_at=now,
+        )
+        PaymentTransaction.objects.create(
+            reservation=reservation,
+            payment_type=PaymentType.TOTAL,
+            preference_id="pref_rejected",
+            payment_id="mp_rejected_1",
+            external_reference=f"TENIS-RESERVA-{reservation.id}-TOTAL-report-rejected",
+            status=PaymentTransactionStatus.REJECTED,
+            status_detail="cc_rejected_other_reason",
+            base_amount=reservation.total_price,
+            identification_decimal=Decimal("0.19"),
+            mp_amount=reservation.total_price + Decimal("0.19"),
+            amount_received=reservation.total_price + Decimal("0.19"),
+        )
+
+        self.client.force_authenticate(user=self.admin)
+        response = self.client.get(
+            reverse("mercadopago-report-csv"),
+            {
+                "start_date": timezone.localdate().isoformat(),
+                "end_date": timezone.localdate().isoformat(),
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response["Content-Type"], "text/csv; charset=utf-8")
+        rows = list(csv.DictReader(StringIO(response.content.decode("utf-8"))))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["nro_operacion_mp"], approved_transaction.payment_id)
+        self.assertEqual(rows[0]["metodo_pago"], PaymentProvider.MERCADOPAGO)
+        self.assertEqual(rows[0]["estado"], PaymentTransactionStatus.APPROVED)
+        self.assertEqual(rows[0]["monto_reserva"], str(player.price_applied))
+        self.assertEqual(rows[0]["monto_cobrado_mp"], str(player.price_applied + Decimal("0.19")))
+        self.assertEqual(rows[0]["external_reference"], approved_transaction.external_reference)
+
+    @override_settings(CASH_PAYMENT_CONFIRMATION_PASSWORD="cash-secret")
+    def test_admin_export_monthly_report_csv_includes_cash_payments(self):
+        create_response = self.client.post(reverse("reservation-list"), self._reservation_payload(), format="json")
+        reservation_id = create_response.data["id"]
+        cash_response = self.client.post(
+            reverse("reservation-confirm-cash-payment", args=[reservation_id]),
+            {"confirmation_password": "cash-secret"},
+            format="json",
+        )
+        self.assertEqual(cash_response.status_code, status.HTTP_201_CREATED)
+
+        self.client.force_authenticate(user=self.admin)
+        response = self.client.get(
+            reverse("mercadopago-report-csv"),
+            {
+                "start_date": timezone.localdate().isoformat(),
+                "end_date": timezone.localdate().isoformat(),
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        rows = list(csv.DictReader(StringIO(response.content.decode("utf-8"))))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["metodo_pago"], PaymentProvider.CASH)
+        self.assertEqual(rows[0]["estado"], PaymentTransactionStatus.APPROVED)
+        self.assertEqual(rows[0]["monto_reserva"], "10000.00")
+        self.assertEqual(rows[0]["decimal_identificador"], "0.00")
+        self.assertEqual(rows[0]["nro_operacion_mp"], "")
+
+    def test_non_admin_cannot_export_mercadopago_report_csv(self):
+        response = self.client.get(
+            reverse("mercadopago-report-csv"),
+            {
+                "start_date": timezone.localdate().isoformat(),
+                "end_date": timezone.localdate().isoformat(),
+            },
+        )
+
+        self.assertIn(
+            response.status_code,
+            (status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN),
+        )
+
+    def test_expire_pending_reservations_keeps_unpaid_slot_blocked(self):
+        create_response = self.client.post(reverse("reservation-list"), self._reservation_payload(), format="json")
+        reservation = Reservation.objects.get(id=create_response.data["id"])
+        reservation.payment_expires_at = timezone.now() - timedelta(minutes=1)
+        reservation.save(update_fields=("payment_expires_at", "updated_at"))
+
+        call_command("expire_pending_reservations")
+
+        reservation.refresh_from_db()
+        self.assertEqual(reservation.payment_status, ReservationPaymentStatus.PENDING_PAYMENT)
+        second_response = self.client.post(reverse("reservation-list"), self._reservation_payload(), format="json")
+        self.assertEqual(second_response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_expire_pending_reservations_keeps_partial_payment_without_admin_review(self):
+        create_response = self.client.post(reverse("reservation-list"), self._reservation_payload(), format="json")
+        reservation = Reservation.objects.get(id=create_response.data["id"])
+        first_player = reservation.players.order_by("id").first()
+        reservation.paid_amount = first_player.price_applied
+        reservation.payment_status = ReservationPaymentStatus.PARTIAL_PAYMENT
+        reservation.payment_expires_at = timezone.now() - timedelta(minutes=1)
+        reservation.save(
+            update_fields=("paid_amount", "payment_status", "payment_expires_at", "updated_at")
+        )
+
+        call_command("expire_pending_reservations")
+
+        reservation.refresh_from_db()
+        self.assertEqual(reservation.payment_status, ReservationPaymentStatus.PARTIAL_PAYMENT)
+        self.assertFalse(reservation.requires_admin_review)
+        second_response = self.client.post(reverse("reservation-list"), self._reservation_payload(), format="json")
+        self.assertEqual(second_response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_run_scheduled_tasks_runs_current_scheduler_tasks(self):
+        output = StringIO()
+        with patch(
+            "reservations.management.commands.run_scheduled_tasks.generate_recurring_reservations",
+            return_value=3,
+        ) as recurring_mock:
+            call_command("run_scheduled_tasks", "--days-ahead=14", stdout=output)
+
+        recurring_mock.assert_called_once_with(days_ahead=14)
+        self.assertIn("Expired without payment: 0", output.getvalue())
+        self.assertIn("Marked for review: 0", output.getvalue())
+        self.assertIn("Generated recurring reservations: 3", output.getvalue())
+
+    def test_run_scheduled_tasks_skips_when_lock_exists(self):
+        output = StringIO()
+        with TemporaryDirectory() as lock_dir:
+            os.mkdir(os.path.join(lock_dir, "csitenis_run_scheduled_tasks.lock"))
+            with patch(
+                "reservations.management.commands.run_scheduled_tasks.generate_recurring_reservations"
+            ) as recurring_mock:
+                call_command("run_scheduled_tasks", lock_dir=lock_dir, stdout=output)
+
+        recurring_mock.assert_not_called()
+        self.assertIn("already running", output.getvalue())
 
     def test_admin_can_filter_unpaid_reservations(self):
         first_response = self.client.post(reverse("reservation-list"), self._reservation_payload(), format="json")
