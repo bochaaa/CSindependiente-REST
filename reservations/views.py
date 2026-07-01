@@ -436,7 +436,7 @@ class ReservationViewSet(
 
     @extend_schema(
         description=(
-            "Search future reservations with pending balance by participant first name, last name, "
+            "Search reservations with pending balance by participant first name, last name, "
             "full name, or reservation contact name. Public endpoint for players who need to find "
             "their reservation to pay."
         ),

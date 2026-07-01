@@ -36,6 +36,7 @@ from .models import (
     RecurringReservationRule,
     Reservation,
     ReservationPaymentStatus,
+    ReservationPlayer,
     ReservationStatus,
     ReservationType,
     SpecialSchedule,
@@ -695,6 +696,39 @@ class ReservationBusinessRulesTests(APITestCase):
         self.assertEqual(response.data[0]["id"], reservation_id)
         self.assertEqual(response.data[0]["contact_name"], "Maria Gomez")
         self.assertEqual(response.data[0]["matching_players"], [])
+
+    def test_search_payable_reservations_includes_past_unpaid_reservation(self):
+        start_datetime = timezone.now() - timedelta(days=1)
+        reservation = Reservation.objects.create(
+            court=self.court,
+            reservation_type=ReservationType.NORMAL,
+            game_mode=GameMode.SINGLES,
+            contact_name="Lucre",
+            contact_phone="2302691967",
+            start_datetime=start_datetime,
+            end_datetime=start_datetime + timedelta(minutes=90),
+            status=ReservationStatus.CONFIRMED,
+            total_price=Decimal("16000.00"),
+            paid_amount=Decimal("0.00"),
+            payment_status=ReservationPaymentStatus.PENDING_PAYMENT,
+        )
+        ReservationPlayer.objects.create(
+            reservation=reservation,
+            first_name="Lucre",
+            last_name="Fraire",
+            is_member=True,
+            price_applied=Decimal("8000.00"),
+        )
+
+        response = self.client.get(
+            reverse("reservation-search-payments-by-player"),
+            {"q": "Lucre"},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["id"], reservation.id)
+        self.assertEqual(response.data[0]["contact_name"], "Lucre")
 
     def test_search_payable_reservations_requires_minimum_query_length(self):
         response = self.client.get(
@@ -1416,3 +1450,131 @@ class SeedInitialDataCommandTests(TestCase):
                 valid_from=today,
             ).exists()
         )
+
+
+class ResetLaunchDataCommandTests(TestCase):
+    def test_reset_launch_data_dry_run_does_not_delete_transactional_data(self):
+        court = Court.objects.create(name="Cancha test", active=True)
+        reservation = Reservation.objects.create(
+            court=court,
+            reservation_type=ReservationType.NORMAL,
+            game_mode=GameMode.SINGLES,
+            contact_name="Cliente Test",
+            contact_phone="2302000000",
+            start_datetime=timezone.now() + timedelta(days=1),
+            end_datetime=timezone.now() + timedelta(days=1, minutes=90),
+            status=ReservationStatus.CONFIRMED,
+            total_price=Decimal("10000.00"),
+        )
+        PaymentTransaction.objects.create(
+            reservation=reservation,
+            payment_type=PaymentType.TOTAL,
+            external_reference="TENIS-RESERVA-TEST-DRY-RUN",
+            base_amount=Decimal("10000.00"),
+            identification_decimal=Decimal("0.19"),
+            mp_amount=Decimal("10000.19"),
+        )
+
+        output = StringIO()
+        call_command("reset_launch_data", stdout=output)
+
+        self.assertIn("Dry run only", output.getvalue())
+        self.assertEqual(Reservation.objects.count(), 1)
+        self.assertEqual(PaymentTransaction.objects.count(), 1)
+
+    def test_reset_launch_data_deletes_transactional_data_and_preserves_configuration(self):
+        court = Court.objects.create(name="Cancha test", active=True)
+        PriceRule.objects.create(
+            game_mode=GameMode.SINGLES,
+            player_type=PlayerType.MEMBER,
+            price=Decimal("8000.00"),
+            active=True,
+        )
+        recurring_rule = RecurringReservationRule.objects.create(
+            court=court,
+            title="Clase fija",
+            days_of_week=[DayOfWeek.MONDAY],
+            start_time=time(hour=10, minute=0),
+            start_date=timezone.localdate(),
+            active=True,
+        )
+        reservation = Reservation.objects.create(
+            court=court,
+            reservation_type=ReservationType.NORMAL,
+            game_mode=GameMode.SINGLES,
+            contact_name="Cliente Test",
+            contact_phone="2302000000",
+            start_datetime=timezone.now() + timedelta(days=1),
+            end_datetime=timezone.now() + timedelta(days=1, minutes=90),
+            status=ReservationStatus.CONFIRMED,
+            total_price=Decimal("10000.00"),
+        )
+        player = ReservationPlayer.objects.create(
+            reservation=reservation,
+            first_name="Cliente",
+            last_name="Test",
+            is_member=True,
+            price_applied=Decimal("8000.00"),
+        )
+        PaymentTransaction.objects.create(
+            reservation=reservation,
+            player=player,
+            payment_type=PaymentType.PLAYER,
+            external_reference="TENIS-RESERVA-TEST-RESET",
+            base_amount=Decimal("8000.00"),
+            identification_decimal=Decimal("0.19"),
+            mp_amount=Decimal("8000.19"),
+        )
+        CancellationRequest.objects.create(
+            reservation=reservation,
+            requester_name="Cliente Test",
+            requester_phone="2302000000",
+            reason="Prueba",
+        )
+        NotificationLog.objects.create(
+            reservation=reservation,
+            channel=NotificationChannel.PUSH,
+            destination="test-device",
+        )
+        BlockedSlot.objects.create(
+            court=court,
+            start_datetime=timezone.now() + timedelta(days=2),
+            end_datetime=timezone.now() + timedelta(days=2, hours=1),
+            block_type=BlockType.OTHER,
+            reason="Bloqueo real",
+        )
+
+        output = StringIO()
+        call_command("reset_launch_data", "--confirm", "RESET_LAUNCH_DATA", stdout=output)
+
+        self.assertIn("Launch data reset completed", output.getvalue())
+        self.assertEqual(Reservation.objects.count(), 0)
+        self.assertEqual(ReservationPlayer.objects.count(), 0)
+        self.assertEqual(PaymentTransaction.objects.count(), 0)
+        self.assertEqual(CancellationRequest.objects.count(), 0)
+        self.assertEqual(NotificationLog.objects.count(), 0)
+        self.assertEqual(BlockedSlot.objects.count(), 1)
+        self.assertEqual(Court.objects.filter(id=court.id).count(), 1)
+        self.assertEqual(PriceRule.objects.count(), 1)
+        self.assertEqual(RecurringReservationRule.objects.filter(id=recurring_rule.id).count(), 1)
+
+    def test_reset_launch_data_can_delete_blocked_slots_when_requested(self):
+        court = Court.objects.create(name="Cancha test", active=True)
+        BlockedSlot.objects.create(
+            court=court,
+            start_datetime=timezone.now() + timedelta(days=2),
+            end_datetime=timezone.now() + timedelta(days=2, hours=1),
+            block_type=BlockType.OTHER,
+            reason="Bloqueo de prueba",
+        )
+
+        call_command(
+            "reset_launch_data",
+            "--confirm",
+            "RESET_LAUNCH_DATA",
+            "--delete-blocked-slots",
+            stdout=StringIO(),
+        )
+
+        self.assertEqual(BlockedSlot.objects.count(), 0)
+        self.assertEqual(Court.objects.filter(id=court.id).count(), 1)
