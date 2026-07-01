@@ -69,7 +69,7 @@ from .services import (
     generate_recurring_reservations,
     get_today_pending_payment_reservations,
     process_mercadopago_webhook_payment,
-    search_payable_reservations_by_player_name,
+    search_payable_reservations_by_participant_or_contact_name,
     set_reservation_payment_status,
 )
 
@@ -437,7 +437,8 @@ class ReservationViewSet(
     @extend_schema(
         description=(
             "Search future reservations with pending balance by participant first name, last name, "
-            "or full name. Public endpoint for players who need to find their reservation to pay."
+            "full name, or reservation contact name. Public endpoint for players who need to find "
+            "their reservation to pay."
         ),
         parameters=[
             OpenApiParameter(
@@ -445,7 +446,7 @@ class ReservationViewSet(
                 type=str,
                 required=True,
                 location=OpenApiParameter.QUERY,
-                description="Player name search. Minimum 3 characters. Example: jose hernandez.",
+                description="Player or contact name search. Minimum 3 characters. Example: jose hernandez.",
             )
         ],
         responses={200: ReservationPaymentSearchResultSerializer(many=True)},
@@ -456,7 +457,7 @@ class ReservationViewSet(
         query_serializer.is_valid(raise_exception=True)
         query = query_serializer.validated_data["q"]
         tokens = [token.strip().lower() for token in query.split() if token.strip()]
-        reservations = search_payable_reservations_by_player_name(query=query)
+        reservations = search_payable_reservations_by_participant_or_contact_name(query=query)
         serializer = ReservationPaymentSearchResultSerializer(
             reservations,
             many=True,

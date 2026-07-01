@@ -674,6 +674,28 @@ class ReservationBusinessRulesTests(APITestCase):
         self.assertEqual(len(response.data[0]["matching_players"]), 1)
         self.assertEqual(response.data[0]["matching_players"][0]["first_name"], "Jose")
 
+    def test_search_payable_reservations_by_contact_name(self):
+        payload = self._reservation_payload(
+            players=[
+                {"first_name": "Jose", "last_name": "Hernandez", "is_member": True},
+                {"first_name": "Santi", "last_name": "Fernandez", "is_member": False},
+            ]
+        )
+        payload["contact_name"] = "Maria Gomez"
+        create_response = self.client.post(reverse("reservation-list"), payload, format="json")
+        reservation_id = create_response.data["id"]
+
+        response = self.client.get(
+            reverse("reservation-search-payments-by-player"),
+            {"q": "maria gomez"},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["id"], reservation_id)
+        self.assertEqual(response.data[0]["contact_name"], "Maria Gomez")
+        self.assertEqual(response.data[0]["matching_players"], [])
+
     def test_search_payable_reservations_requires_minimum_query_length(self):
         response = self.client.get(
             reverse("reservation-search-payments-by-player"),

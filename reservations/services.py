@@ -938,27 +938,32 @@ def create_reservation_payment_link(
     return payment_transaction
 
 
-def search_payable_reservations_by_player_name(query: str, limit: int = 10):
+def search_payable_reservations_by_participant_or_contact_name(query: str, limit: int = 10):
     tokens = [token.strip() for token in query.split() if token.strip()]
     if not tokens:
         return Reservation.objects.none()
 
-    players = ReservationPlayer.objects.filter(
-        reservation__start_datetime__gte=timezone.now(),
-        reservation__status__in=(
+    base_reservations = Reservation.objects.filter(
+        start_datetime__gte=timezone.now(),
+        status__in=(
             ReservationStatus.CONFIRMED,
             ReservationStatus.CANCELLATION_REQUESTED,
         ),
-        reservation__payment_status__in=(
+        payment_status__in=(
             ReservationPaymentStatus.PENDING_PAYMENT,
             ReservationPaymentStatus.PARTIAL_PAYMENT,
         ),
-        reservation__paid_amount__lt=F("reservation__total_price"),
+        paid_amount__lt=F("total_price"),
     )
+
+    players = ReservationPlayer.objects.filter(reservation__in=base_reservations)
+    contact_reservations = base_reservations
     for token in tokens:
         players = players.filter(Q(first_name__icontains=token) | Q(last_name__icontains=token))
+        contact_reservations = contact_reservations.filter(contact_name__icontains=token)
 
-    reservation_ids = list(players.values_list("reservation_id", flat=True).distinct()[:limit])
+    reservation_ids = set(players.values_list("reservation_id", flat=True).distinct()[:limit])
+    reservation_ids.update(contact_reservations.values_list("id", flat=True).distinct()[:limit])
     return (
         Reservation.objects.select_related("court")
         .prefetch_related(
