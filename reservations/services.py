@@ -944,7 +944,6 @@ def search_payable_reservations_by_participant_or_contact_name(query: str, limit
         return Reservation.objects.none()
 
     base_reservations = Reservation.objects.filter(
-        start_datetime__gte=timezone.now(),
         status__in=(
             ReservationStatus.CONFIRMED,
             ReservationStatus.CANCELLATION_REQUESTED,
