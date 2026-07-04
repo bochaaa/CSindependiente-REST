@@ -67,6 +67,16 @@ DAY_OF_WEEK_BY_INDEX = {
     6: DayOfWeek.SUNDAY,
 }
 
+DAY_OF_WEEK_DISPLAY_NAMES = {
+    DayOfWeek.MONDAY: "Lunes",
+    DayOfWeek.TUESDAY: "Martes",
+    DayOfWeek.WEDNESDAY: "Miercoles",
+    DayOfWeek.THURSDAY: "Jueves",
+    DayOfWeek.FRIDAY: "Viernes",
+    DayOfWeek.SATURDAY: "Sabado",
+    DayOfWeek.SUNDAY: "Domingo",
+}
+
 
 @dataclass
 class PlayerPricingResult:
@@ -300,6 +310,223 @@ def check_overlap(
     ).exists()
 
 
+def check_recurring_rule_overlap(
+    court: Court,
+    start_datetime: datetime,
+    end_datetime: datetime,
+    exclude_rule_id: int | None = None,
+) -> bool:
+    local_start = timezone.localtime(start_datetime)
+    local_end = timezone.localtime(end_datetime)
+    weekday = DAY_OF_WEEK_BY_INDEX[local_start.date().weekday()]
+    rules = RecurringReservationRule.objects.filter(
+        court=court,
+        active=True,
+        start_date__lte=local_start.date(),
+    ).filter(Q(end_date__isnull=True) | Q(end_date__gte=local_start.date()))
+    if exclude_rule_id:
+        rules = rules.exclude(id=exclude_rule_id)
+
+    for rule in rules:
+        if weekday not in rule.days_of_week:
+            continue
+        rule_end_time = _time_plus_class_duration(rule.start_time)
+        if rule.start_time < local_end.time() and rule_end_time > local_start.time():
+            return True
+    return False
+
+
+def _time_plus_class_duration(start_time: time) -> time:
+    base_datetime = datetime.combine(timezone.localdate(), start_time)
+    return (base_datetime + timedelta(minutes=CLASS_RESERVATION_MINUTES)).time()
+
+
+def _date_ranges_overlap(
+    first_start: date,
+    first_end: date | None,
+    second_start: date,
+    second_end: date | None,
+) -> tuple[date, date | None] | None:
+    overlap_start = max(first_start, second_start)
+    finite_ends = [end for end in (first_end, second_end) if end is not None]
+    overlap_end = min(finite_ends) if finite_ends else None
+    if overlap_end is not None and overlap_end < overlap_start:
+        return None
+    return overlap_start, overlap_end
+
+
+def _has_weekday_occurrence(days_of_week: set[str], start_date: date, end_date: date | None) -> bool:
+    if not days_of_week:
+        return False
+    if end_date is None:
+        return True
+
+    indexes_by_day = {value: index for index, value in DAY_OF_WEEK_BY_INDEX.items()}
+    for day in days_of_week:
+        day_index = indexes_by_day[day]
+        days_until_occurrence = (day_index - start_date.weekday()) % 7
+        occurrence = start_date + timedelta(days=days_until_occurrence)
+        if occurrence <= end_date:
+            return True
+    return False
+
+
+def _rule_occurrence_overlaps_interval(
+    *,
+    days_of_week: set[str],
+    start_time: time,
+    interval_start: datetime,
+    interval_end: datetime,
+) -> bool:
+    local_start = timezone.localtime(interval_start)
+    local_end = timezone.localtime(interval_end)
+    if DAY_OF_WEEK_BY_INDEX[local_start.date().weekday()] not in days_of_week:
+        return False
+    target_end_time = _time_plus_class_duration(start_time)
+    return start_time < local_end.time() and target_end_time > local_start.time()
+
+
+def _build_recurring_rule_unavailable_error(occupied_days: set[str]) -> serializers.ValidationError:
+    ordered_days = [
+        day
+        for day in DayOfWeek.values
+        if day in occupied_days
+    ]
+    occupied_day_names = [DAY_OF_WEEK_DISPLAY_NAMES[day] for day in ordered_days]
+    return serializers.ValidationError(
+        {
+            "detail": (
+                "La cancha no esta disponible los dias: "
+                f"{', '.join(occupied_day_names)}."
+            ),
+            "occupied_days": ordered_days,
+            "occupied_day_names": occupied_day_names,
+        }
+    )
+
+
+def _rule_existing_occupancy_days(
+    *,
+    court: Court,
+    days_of_week: set[str],
+    start_time: time,
+    start_date: date,
+    end_date: date | None,
+    exclude_rule_id: int | None,
+) -> set[str]:
+    occupied_days = set()
+    reservations = get_blocking_reservation_queryset().filter(
+        court=court,
+        start_datetime__date__gte=start_date,
+    )
+    blocked_slots = BlockedSlot.objects.filter(
+        court=court,
+        start_datetime__date__gte=start_date,
+    )
+    if end_date:
+        reservations = reservations.filter(start_datetime__date__lte=end_date)
+        blocked_slots = blocked_slots.filter(start_datetime__date__lte=end_date)
+    if exclude_rule_id:
+        reservations = reservations.exclude(recurring_rule_id=exclude_rule_id)
+
+    for reservation in reservations:
+        if _rule_occurrence_overlaps_interval(
+            days_of_week=days_of_week,
+            start_time=start_time,
+            interval_start=reservation.start_datetime,
+            interval_end=reservation.end_datetime,
+        ):
+            local_start = timezone.localtime(reservation.start_datetime)
+            occupied_days.add(DAY_OF_WEEK_BY_INDEX[local_start.date().weekday()])
+
+    for blocked_slot in blocked_slots:
+        if _rule_occurrence_overlaps_interval(
+            days_of_week=days_of_week,
+            start_time=start_time,
+            interval_start=blocked_slot.start_datetime,
+            interval_end=blocked_slot.end_datetime,
+        ):
+            local_start = timezone.localtime(blocked_slot.start_datetime)
+            occupied_days.add(DAY_OF_WEEK_BY_INDEX[local_start.date().weekday()])
+    return occupied_days
+
+
+def _rule_conflicting_recurring_days(
+    *,
+    court: Court,
+    days_of_week: set[str],
+    start_time: time,
+    start_date: date,
+    end_date: date | None,
+    exclude_rule_id: int | None,
+) -> set[str]:
+    occupied_days = set()
+    target_end_time = _time_plus_class_duration(start_time)
+    rules = RecurringReservationRule.objects.filter(court=court, active=True)
+    if exclude_rule_id:
+        rules = rules.exclude(id=exclude_rule_id)
+
+    for rule in rules:
+        shared_days = days_of_week.intersection(rule.days_of_week)
+        if not shared_days:
+            continue
+
+        overlapping_dates = _date_ranges_overlap(
+            first_start=start_date,
+            first_end=end_date,
+            second_start=rule.start_date,
+            second_end=rule.end_date,
+        )
+        if not overlapping_dates:
+            continue
+
+        overlap_start, overlap_end = overlapping_dates
+        rule_end_time = _time_plus_class_duration(rule.start_time)
+        if not (rule.start_time < target_end_time and rule_end_time > start_time):
+            continue
+
+        for day in shared_days:
+            if _has_weekday_occurrence({day}, overlap_start, overlap_end):
+                occupied_days.add(day)
+    return occupied_days
+
+
+def validate_recurring_rule_availability(
+    *,
+    court: Court,
+    days_of_week: list[str],
+    start_time: time,
+    start_date: date,
+    end_date: date | None = None,
+    active: bool = True,
+    exclude_rule_id: int | None = None,
+) -> None:
+    if not active:
+        return
+
+    target_days = set(days_of_week)
+    occupied_days = _rule_existing_occupancy_days(
+        court=court,
+        days_of_week=target_days,
+        start_time=start_time,
+        start_date=start_date,
+        end_date=end_date,
+        exclude_rule_id=exclude_rule_id,
+    )
+    occupied_days.update(
+        _rule_conflicting_recurring_days(
+            court=court,
+            days_of_week=target_days,
+            start_time=start_time,
+            start_date=start_date,
+            end_date=end_date,
+            exclude_rule_id=exclude_rule_id,
+        )
+    )
+    if occupied_days:
+        raise _build_recurring_rule_unavailable_error(occupied_days)
+
+
 def validate_reservation_datetime(start_datetime: datetime, end_datetime: datetime):
     now = timezone.localtime()
     if start_datetime.date() < now.date():
@@ -334,7 +561,15 @@ def create_reservation(data: dict, created_by=None) -> Reservation:
     end_datetime = start_datetime + timedelta(minutes=NORMAL_RESERVATION_MINUTES)
     validate_reservation_datetime(start_datetime=start_datetime, end_datetime=end_datetime)
 
-    if check_overlap(court=court, start_datetime=start_datetime, end_datetime=end_datetime):
+    if check_overlap(
+        court=court,
+        start_datetime=start_datetime,
+        end_datetime=end_datetime,
+    ) or check_recurring_rule_overlap(
+        court=court,
+        start_datetime=start_datetime,
+        end_datetime=end_datetime,
+    ):
         raise serializers.ValidationError({"detail": "La cancha no esta disponible en ese horario."})
 
     players_input = data["players"]

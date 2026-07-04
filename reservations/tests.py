@@ -1062,6 +1062,142 @@ class ReservationBusinessRulesTests(APITestCase):
         )
         self.assertEqual(generated.count(), 1)
 
+    def test_recurring_rule_create_endpoint_rejects_same_court_day_and_time_overlap(self):
+        target_date = timezone.localdate() + timedelta(days=1)
+        day = DayOfWeek.values[target_date.weekday()]
+        self.client.force_authenticate(user=self.admin)
+
+        first_response = self.client.post(
+            reverse("recurring-rule-list"),
+            {
+                "court": self.court.id,
+                "title": "Clase Pedro",
+                "days_of_week": [day],
+                "start_time": "09:00",
+                "start_date": target_date.isoformat(),
+                "end_date": target_date.isoformat(),
+                "active": True,
+                "notes": "",
+            },
+            format="json",
+        )
+        self.assertEqual(first_response.status_code, status.HTTP_201_CREATED)
+
+        second_response = self.client.post(
+            reverse("recurring-rule-list"),
+            {
+                "court": self.court.id,
+                "title": "Clase Duplicada",
+                "days_of_week": [day],
+                "start_time": "09:00",
+                "start_date": target_date.isoformat(),
+                "end_date": target_date.isoformat(),
+                "active": True,
+                "notes": "",
+            },
+            format="json",
+        )
+
+        self.assertEqual(second_response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(RecurringReservationRule.objects.count(), 1)
+        self.assertEqual(
+            Reservation.objects.filter(reservation_type=ReservationType.CLASS).count(),
+            1,
+        )
+
+    def test_recurring_rule_create_endpoint_rejects_existing_reservation_overlap(self):
+        target_date = timezone.localdate() + timedelta(days=1)
+        day = DayOfWeek.values[target_date.weekday()]
+        reservation_response = self.client.post(
+            reverse("reservation-list"),
+            self._reservation_payload(target_date=target_date, start_time="09:00"),
+            format="json",
+        )
+        self.assertEqual(reservation_response.status_code, status.HTTP_201_CREATED)
+
+        self.client.force_authenticate(user=self.admin)
+        class_response = self.client.post(
+            reverse("recurring-rule-list"),
+            {
+                "court": self.court.id,
+                "title": "Clase Sobre Reserva",
+                "days_of_week": [day],
+                "start_time": "09:00",
+                "start_date": target_date.isoformat(),
+                "end_date": target_date.isoformat(),
+                "active": True,
+                "notes": "",
+            },
+            format="json",
+        )
+
+        self.assertEqual(class_response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(RecurringReservationRule.objects.count(), 0)
+
+    def test_recurring_rule_create_endpoint_reports_occupied_day_when_one_requested_day_is_unavailable(self):
+        today = timezone.localdate()
+        days_until_monday = (0 - today.weekday()) % 7 or 7
+        monday = today + timedelta(days=days_until_monday)
+        wednesday = monday + timedelta(days=2)
+        reservation_response = self.client.post(
+            reverse("reservation-list"),
+            self._reservation_payload(target_date=monday, start_time="14:00"),
+            format="json",
+        )
+        self.assertEqual(reservation_response.status_code, status.HTTP_201_CREATED)
+
+        self.client.force_authenticate(user=self.admin)
+        class_response = self.client.post(
+            reverse("recurring-rule-list"),
+            {
+                "court": self.court.id,
+                "title": "Clase Lunes y Miercoles",
+                "days_of_week": [DayOfWeek.MONDAY, DayOfWeek.WEDNESDAY],
+                "start_time": "14:00",
+                "start_date": monday.isoformat(),
+                "end_date": wednesday.isoformat(),
+                "active": True,
+                "notes": "",
+            },
+            format="json",
+        )
+
+        self.assertEqual(class_response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("Lunes", str(class_response.data["detail"]))
+        self.assertEqual(
+            [str(day) for day in class_response.data["occupied_days"]],
+            [DayOfWeek.MONDAY],
+        )
+        self.assertEqual(
+            [str(day) for day in class_response.data["occupied_day_names"]],
+            ["Lunes"],
+        )
+        self.assertEqual(RecurringReservationRule.objects.count(), 0)
+
+    def test_reservation_create_rejects_active_recurring_rule_without_generated_class(self):
+        target_date = timezone.localdate() + timedelta(days=1)
+        day = DayOfWeek.values[target_date.weekday()]
+        RecurringReservationRule.objects.create(
+            court=self.court,
+            title="Clase Sin Generar",
+            days_of_week=[day],
+            start_time=time(hour=9, minute=0),
+            start_date=target_date,
+            end_date=target_date,
+            active=True,
+            notes="",
+            created_by=self.admin,
+        )
+
+        response = self.client.post(
+            reverse("reservation-list"),
+            self._reservation_payload(target_date=target_date, start_time="09:00"),
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(Reservation.objects.count(), 0)
+
     def test_recurring_rule_create_endpoint_generates_90_day_horizon(self):
         today = timezone.localdate()
         self.client.force_authenticate(user=self.admin)
@@ -1139,6 +1275,58 @@ class ReservationBusinessRulesTests(APITestCase):
             status=ReservationStatus.CONFIRMED,
         )
         self.assertEqual(new_classes.count(), 1)
+
+    def test_recurring_rule_update_rejects_overlap_with_other_active_rule(self):
+        first_date = timezone.localdate() + timedelta(days=1)
+        second_date = timezone.localdate() + timedelta(days=2)
+        first_day = DayOfWeek.values[first_date.weekday()]
+        second_day = DayOfWeek.values[second_date.weekday()]
+        self.client.force_authenticate(user=self.admin)
+
+        first_response = self.client.post(
+            reverse("recurring-rule-list"),
+            {
+                "court": self.court.id,
+                "title": "Clase Fija",
+                "days_of_week": [first_day],
+                "start_time": "10:00",
+                "start_date": first_date.isoformat(),
+                "end_date": first_date.isoformat(),
+                "active": True,
+                "notes": "",
+            },
+            format="json",
+        )
+        self.assertEqual(first_response.status_code, status.HTTP_201_CREATED)
+
+        second_response = self.client.post(
+            reverse("recurring-rule-list"),
+            {
+                "court": self.court.id,
+                "title": "Clase Movible",
+                "days_of_week": [second_day],
+                "start_time": "12:00",
+                "start_date": second_date.isoformat(),
+                "end_date": second_date.isoformat(),
+                "active": True,
+                "notes": "",
+            },
+            format="json",
+        )
+        self.assertEqual(second_response.status_code, status.HTTP_201_CREATED)
+
+        update_response = self.client.patch(
+            reverse("recurring-rule-detail", args=[second_response.data["id"]]),
+            {
+                "days_of_week": [first_day],
+                "start_time": "10:00",
+                "start_date": first_date.isoformat(),
+                "end_date": first_date.isoformat(),
+            },
+            format="json",
+        )
+
+        self.assertEqual(update_response.status_code, status.HTTP_400_BAD_REQUEST)
 
     def test_recurring_rule_allows_null_notes(self):
         target_date = timezone.localdate() + timedelta(days=1)

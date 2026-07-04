@@ -769,7 +769,7 @@ class AdminTokenRefreshView(TokenRefreshView):
 
 
 @extend_schema(
-    description="Return current authenticated user profile from JWT/session.",
+    description="Return current authenticated user profile from JWT.",
     responses={200: AuthUserSerializer},
 )
 class AuthMeAPIView(APIView):

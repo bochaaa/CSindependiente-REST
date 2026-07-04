@@ -35,6 +35,7 @@ from .services import (
     get_schedule_for_date,
     register_cash_payment,
     resolve_cancellation_request,
+    validate_recurring_rule_availability,
 )
 
 
@@ -494,6 +495,9 @@ class RecurringReservationRuleSerializer(serializers.ModelSerializer):
         target_court = attrs.get("court") or getattr(self.instance, "court", None)
         start_time = attrs.get("start_time") or getattr(self.instance, "start_time", None)
         start_date = attrs.get("start_date") or getattr(self.instance, "start_date", None)
+        end_date = attrs.get("end_date") if "end_date" in attrs else getattr(self.instance, "end_date", None)
+        days_of_week = attrs.get("days_of_week") or getattr(self.instance, "days_of_week", None)
+        active = attrs.get("active") if "active" in attrs else getattr(self.instance, "active", True)
         if target_court and not target_court.active:
             raise serializers.ValidationError({"court": "La cancha debe estar activa para reglas recurrentes."})
         if start_time and start_date:
@@ -509,6 +513,16 @@ class RecurringReservationRuleSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError(
                     {"detail": "La clase recurrente esta fuera del horario del club."}
                 )
+        if target_court and days_of_week and start_time and start_date:
+            validate_recurring_rule_availability(
+                court=target_court,
+                days_of_week=days_of_week,
+                start_time=start_time,
+                start_date=start_date,
+                end_date=end_date,
+                active=active,
+                exclude_rule_id=getattr(self.instance, "id", None),
+            )
         return attrs
 
     def create(self, validated_data):
