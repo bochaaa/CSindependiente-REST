@@ -53,7 +53,7 @@ logger = logging.getLogger(__name__)
 
 NORMAL_RESERVATION_MINUTES = 90
 CLASS_RESERVATION_MINUTES = 60
-SAME_DAY_RESERVATION_MIN_ADVANCE_HOURS = 3
+SAME_DAY_RESERVATION_MIN_ADVANCE_MINUTES = 45
 RECURRING_GENERATION_RETRY_ATTEMPTS = 3
 PAYMENT_REFERENCE_RE = re.compile(r"^TENIS-RESERVA-(?P<reservation_id>\d+)-")
 
@@ -531,13 +531,13 @@ def validate_reservation_datetime(start_datetime: datetime, end_datetime: dateti
     now = timezone.localtime()
     if start_datetime.date() < now.date():
         raise serializers.ValidationError({"date": "No se permite reservar en fecha pasada."})
-    same_day_min_start_datetime = now + timedelta(hours=SAME_DAY_RESERVATION_MIN_ADVANCE_HOURS)
+    same_day_min_start_datetime = now + timedelta(minutes=SAME_DAY_RESERVATION_MIN_ADVANCE_MINUTES)
     if start_datetime.date() == now.date() and start_datetime < same_day_min_start_datetime:
         raise serializers.ValidationError(
             {
                 "start_time": (
                     "Si la reserva es para hoy, debe hacerse con al menos "
-                    f"{SAME_DAY_RESERVATION_MIN_ADVANCE_HOURS} horas de anticipacion."
+                    f"{SAME_DAY_RESERVATION_MIN_ADVANCE_MINUTES} minutos de anticipacion."
                 )
             }
         )
@@ -646,6 +646,13 @@ def generate_availability_for_date(target_date: date) -> dict:
     open_time, close_time = schedule
     opening_datetime = combine_local_datetime(target_date, open_time)
     closing_datetime = combine_local_datetime(target_date, close_time)
+    availability_start_datetime = opening_datetime
+    now = timezone.localtime()
+    if target_date == now.date():
+        availability_start_datetime = max(
+            opening_datetime,
+            now + timedelta(minutes=SAME_DAY_RESERVATION_MIN_ADVANCE_MINUTES),
+        )
 
     response_courts = []
     for court in courts:
@@ -765,7 +772,7 @@ def generate_availability_for_date(target_date: date) -> dict:
             )
 
         available_ranges = []
-        cursor = opening_datetime
+        cursor = availability_start_datetime
         for interval in merged_busy:
             if cursor < interval["start"]:
                 range_start = cursor
@@ -1551,6 +1558,21 @@ def deactivate_recurring_rule(
         updated_at=now,
     )
     return locked_rule, cancelled_count
+
+
+@transaction.atomic
+def delete_recurring_rule_and_cancel_future_classes(
+    recurring_rule: RecurringReservationRule,
+    deleted_by=None,
+    cancellation_reason: str = "Regla recurrente eliminada por admin.",
+) -> int:
+    locked_rule, cancelled_count = deactivate_recurring_rule(
+        recurring_rule=recurring_rule,
+        deactivated_by=deleted_by,
+        cancellation_reason=cancellation_reason,
+    )
+    locked_rule.delete()
+    return cancelled_count
 
 
 def _generate_reservations_for_rule(

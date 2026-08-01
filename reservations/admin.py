@@ -17,7 +17,7 @@ from .models import (
     ReservationPlayer,
     SpecialSchedule,
 )
-from .services import deactivate_recurring_rule
+from .services import deactivate_recurring_rule, delete_recurring_rule_and_cancel_future_classes
 
 
 class RecurringReservationRuleAdminForm(forms.ModelForm):
@@ -71,6 +71,21 @@ class RecurringReservationRuleAdmin(admin.ModelAdmin):
             request,
             f"Rules deactivated: {queryset.count()}. Future classes cancelled: {cancelled_total}.",
         )
+
+    def delete_model(self, request, obj):
+        delete_recurring_rule_and_cancel_future_classes(
+            recurring_rule=obj,
+            deleted_by=request.user,
+            cancellation_reason="Regla recurrente eliminada desde Django admin.",
+        )
+
+    def delete_queryset(self, request, queryset):
+        for rule in queryset:
+            delete_recurring_rule_and_cancel_future_classes(
+                recurring_rule=rule,
+                deleted_by=request.user,
+                cancellation_reason="Regla recurrente eliminada desde Django admin.",
+            )
 
 
 @admin.register(Reservation)

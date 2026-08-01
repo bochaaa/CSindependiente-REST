@@ -62,6 +62,7 @@ from .serializers import (
 from .services import (
     cancel_reservation_by_admin,
     deactivate_recurring_rule,
+    delete_recurring_rule_and_cancel_future_classes,
     ensure_recurring_rule_generation,
     extract_mercadopago_payment_id,
     build_payment_report_rows,
@@ -182,6 +183,7 @@ class SpecialScheduleViewSet(viewsets.ModelViewSet):
     description=(
         "Get court availability ranges for a specific date. "
         "Returns available and unavailable continuous ranges. "
+        "Today's available ranges respect the minimum booking notice. "
         "For available ranges, includes whether a 90-minute booking fits and the last valid start time. "
         "Public endpoint with 20/min throttling."
     ),
@@ -557,6 +559,13 @@ class RecurringReservationRuleViewSet(viewsets.ModelViewSet):
                 )
         except OperationalError as exc:
             raise RecurringGenerationUnavailable() from exc
+
+    def perform_destroy(self, instance):
+        delete_recurring_rule_and_cancel_future_classes(
+            recurring_rule=instance,
+            deleted_by=self.request.user,
+            cancellation_reason="Regla recurrente eliminada por admin.",
+        )
 
     @extend_schema(
         description=(

@@ -325,12 +325,12 @@ class ReservationBusinessRulesTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn("date", response.data)
 
-    def test_reject_same_day_reservation_with_less_than_three_hours_notice(self):
+    def test_reject_same_day_reservation_with_less_than_45_minutes_notice(self):
         fixed_now = timezone.make_aware(
             datetime.combine(timezone.localdate(), time(hour=10, minute=0)),
             timezone.get_current_timezone(),
         )
-        payload = self._reservation_payload(target_date=timezone.localdate(), start_time="12:00")
+        payload = self._reservation_payload(target_date=timezone.localdate(), start_time="10:44")
 
         with patch("reservations.services.timezone.now", return_value=fixed_now):
             response = self.client.post(reverse("reservation-list"), payload, format="json")
@@ -338,17 +338,33 @@ class ReservationBusinessRulesTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn("start_time", response.data)
 
-    def test_allow_same_day_reservation_with_three_hours_notice(self):
+    def test_allow_same_day_reservation_with_45_minutes_notice(self):
         fixed_now = timezone.make_aware(
             datetime.combine(timezone.localdate(), time(hour=10, minute=0)),
             timezone.get_current_timezone(),
         )
-        payload = self._reservation_payload(target_date=timezone.localdate(), start_time="13:00")
+        payload = self._reservation_payload(target_date=timezone.localdate(), start_time="10:45")
 
         with patch("reservations.services.timezone.now", return_value=fixed_now):
             response = self.client.post(reverse("reservation-list"), payload, format="json")
 
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+    def test_today_availability_starts_after_45_minute_notice(self):
+        fixed_now = timezone.make_aware(
+            datetime.combine(timezone.localdate(), time(hour=10, minute=0)),
+            timezone.get_current_timezone(),
+        )
+
+        with patch("reservations.services.timezone.now", return_value=fixed_now):
+            response = self.client.get(
+                f"{reverse('availability')}?date={timezone.localdate().isoformat()}"
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        available_ranges = response.data["courts"][0]["available_ranges"]
+        self.assertEqual(available_ranges[0]["start_time"], "10:45:00")
+        self.assertEqual(available_ranges[0]["end_time"], "23:00:00")
 
     def test_reject_overlap_with_confirmed_reservation(self):
         response_1 = self.client.post(reverse("reservation-list"), self._reservation_payload(), format="json")
@@ -1411,6 +1427,67 @@ class ReservationBusinessRulesTests(APITestCase):
             status=ReservationStatus.CONFIRMED,
         )
         self.assertEqual(second_classes.count(), 1)
+
+    def test_django_admin_delete_cancels_future_classes_before_deleting_rule(self):
+        target_date = timezone.localdate() + timedelta(days=1)
+        day = DayOfWeek.values[target_date.weekday()]
+        rule = RecurringReservationRule.objects.create(
+            court=self.court,
+            title="Clase a eliminar",
+            days_of_week=[day],
+            start_time=time(hour=14),
+            start_date=target_date,
+            end_date=target_date,
+            created_by=self.admin,
+        )
+        generate_recurring_reservations(days_ahead=7)
+        generated_class = Reservation.objects.get(recurring_rule=rule)
+
+        self.admin.is_superuser = True
+        self.admin.save(update_fields=("is_superuser",))
+        self.client.force_login(self.admin)
+        response = self.client.post(
+            reverse("admin:reservations_recurringreservationrule_delete", args=[rule.id]),
+            {"post": "yes"},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_302_FOUND)
+        self.assertFalse(RecurringReservationRule.objects.filter(id=rule.id).exists())
+        generated_class.refresh_from_db()
+        self.assertIsNone(generated_class.recurring_rule_id)
+        self.assertEqual(generated_class.status, ReservationStatus.CANCELLED)
+        self.assertIsNotNone(generated_class.cancelled_at)
+        self.assertEqual(generated_class.cancelled_by, self.admin)
+
+    def test_recurring_rule_delete_endpoint_cancels_future_classes(self):
+        target_date = timezone.localdate() + timedelta(days=1)
+        day = DayOfWeek.values[target_date.weekday()]
+        self.client.force_authenticate(user=self.admin)
+        create_response = self.client.post(
+            reverse("recurring-rule-list"),
+            {
+                "court": self.court.id,
+                "title": "Clase eliminada por API",
+                "days_of_week": [day],
+                "start_time": "15:00",
+                "start_date": target_date.isoformat(),
+                "end_date": target_date.isoformat(),
+                "active": True,
+                "notes": "",
+            },
+            format="json",
+        )
+        rule_id = create_response.data["id"]
+        generated_class = Reservation.objects.get(recurring_rule_id=rule_id)
+
+        delete_response = self.client.delete(
+            reverse("recurring-rule-detail", args=[rule_id]),
+        )
+
+        self.assertEqual(delete_response.status_code, status.HTTP_204_NO_CONTENT)
+        generated_class.refresh_from_db()
+        self.assertIsNone(generated_class.recurring_rule_id)
+        self.assertEqual(generated_class.status, ReservationStatus.CANCELLED)
 
     def test_admin_endpoint_requires_jwt_for_write(self):
         create_court_payload = {"name": "Cancha 2", "active": True}
