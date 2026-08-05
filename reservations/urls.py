@@ -10,6 +10,7 @@ from .views import (
     GenerateRecurringReservationsAPIView,
     MercadoPagoReportCSVAPIView,
     NotificationDeviceViewSet,
+    NotificationHistoryAPIView,
     PaymentWebhookAPIView,
     PriceRuleViewSet,
     RecurringReservationRuleViewSet,
@@ -30,6 +31,7 @@ router.register("cancellation-requests", CancellationRequestViewSet, basename="c
 
 urlpatterns = [
     path("", include(router.urls)),
+    path("notifications/", NotificationHistoryAPIView.as_view(), name="notification-history"),
     path("availability/", AvailabilityAPIView.as_view(), name="availability"),
     path(
         "recurring-rules/generate/",

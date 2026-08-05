@@ -45,6 +45,8 @@ from .serializers import (
     MercadoPagoReportQuerySerializer,
     NotificationDeviceSerializer,
     NotificationDeviceUnregisterSerializer,
+    NotificationHistoryQuerySerializer,
+    NotificationHistorySerializer,
     PriceRuleSerializer,
     PlayerReservationPaymentSearchSerializer,
     ReservationPaymentSearchResultSerializer,
@@ -68,6 +70,7 @@ from .services import (
     build_payment_report_rows,
     generate_availability_for_date,
     generate_recurring_reservations,
+    get_global_notification_history,
     get_today_pending_payment_reservations,
     process_mercadopago_webhook_payment,
     search_payable_reservations_by_participant_or_contact_name,
@@ -138,6 +141,29 @@ class NotificationDeviceViewSet(
             queryset = queryset.filter(device_id=device_id)
         disabled_count = queryset.update(enabled=False)
         return Response({"disabled": disabled_count})
+
+
+class NotificationHistoryAPIView(APIView):
+    permission_classes = (IsAdminUser,)
+
+    @extend_schema(
+        description="List the latest global admin notifications, newest first.",
+        parameters=(
+            OpenApiParameter(
+                name="limit",
+                type=int,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description="Number of notifications to return (1-15, default 15).",
+            ),
+        ),
+        responses={200: NotificationHistorySerializer(many=True)},
+    )
+    def get(self, request):
+        query_serializer = NotificationHistoryQuerySerializer(data=request.query_params)
+        query_serializer.is_valid(raise_exception=True)
+        notifications = get_global_notification_history(query_serializer.validated_data["limit"])
+        return Response(NotificationHistorySerializer(notifications, many=True).data)
 
 
 @extend_schema_view(

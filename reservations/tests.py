@@ -171,6 +171,7 @@ class ReservationBusinessRulesTests(APITestCase):
         push_logs = NotificationLog.objects.filter(
             reservation=reservation,
             channel=NotificationChannel.PUSH,
+            is_history=False,
         )
         self.assertEqual(push_logs.count(), 1)
         push_log = push_logs.get()
@@ -178,6 +179,81 @@ class ReservationBusinessRulesTests(APITestCase):
         self.assertEqual(push_log.payload["title"], "Nueva reserva")
         self.assertEqual(push_log.payload["data"]["type"], "reservation_created")
         self.assertEqual(push_log.payload["data"]["reservation_id"], str(reservation.id))
+        history_log = NotificationLog.objects.get(
+            reservation=reservation,
+            channel=NotificationChannel.PUSH,
+            is_history=True,
+        )
+        self.assertEqual(push_log.notification_id, history_log.notification_id)
+        self.assertEqual(
+            push_log.payload["data"]["notification_id"],
+            str(history_log.notification_id),
+        )
+
+    def test_notification_history_is_global_for_admins_and_persists_without_devices(self):
+        response = self.client.post(reverse("reservation-list"), self._reservation_payload(), format="json")
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+        history_log = NotificationLog.objects.get(
+            reservation_id=response.data["id"],
+            channel=NotificationChannel.PUSH,
+            is_history=True,
+        )
+        self.assertEqual(history_log.status, NotificationStatus.RECORDED)
+        self.assertEqual(
+            history_log.payload["data"]["notification_id"],
+            str(history_log.notification_id),
+        )
+
+        second_admin = self.User.objects.create_user(
+            username="second-admin",
+            password="admin123",
+            is_staff=True,
+        )
+        self.client.force_authenticate(user=second_admin)
+        history_response = self.client.get(reverse("notification-history"))
+
+        self.assertEqual(history_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(history_response.data), 1)
+        self.assertEqual(
+            str(history_response.data[0]["notification_id"]),
+            str(history_log.notification_id),
+        )
+        self.assertEqual(history_response.data[0]["title"], "Nueva reserva")
+        self.assertEqual(history_response.data[0]["data"]["reservation_id"], str(response.data["id"]))
+
+    def test_notification_history_rejects_non_admin_and_caps_limit_at_15(self):
+        reservation_response = self.client.post(
+            reverse("reservation-list"),
+            self._reservation_payload(),
+            format="json",
+        )
+        reservation = Reservation.objects.get(id=reservation_response.data["id"])
+        NotificationLog.objects.filter(is_history=True).delete()
+        logs = [
+            NotificationLog.objects.create(
+                reservation=reservation,
+                channel=NotificationChannel.PUSH,
+                destination="",
+                status=NotificationStatus.RECORDED,
+                is_history=True,
+                payload={"title": f"Aviso {index}", "body": "", "data": {}},
+            )
+            for index in range(17)
+        ]
+
+        self.client.force_authenticate(user=self.admin)
+        response = self.client.get(reverse("notification-history"), {"limit": 15})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 15)
+        self.assertEqual(str(response.data[0]["notification_id"]), str(logs[-1].notification_id))
+
+        too_large_response = self.client.get(reverse("notification-history"), {"limit": 16})
+        self.assertEqual(too_large_response.status_code, status.HTTP_400_BAD_REQUEST)
+
+        self.client.force_authenticate(user=self.normal_user)
+        forbidden_response = self.client.get(reverse("notification-history"))
+        self.assertEqual(forbidden_response.status_code, status.HTTP_403_FORBIDDEN)
 
     def test_admin_can_register_and_unregister_notification_device(self):
         self.client.force_authenticate(user=self.admin)
@@ -251,7 +327,7 @@ class ReservationBusinessRulesTests(APITestCase):
         )
         response = self.client.post(reverse("reservation-list"), self._reservation_payload(), format="json")
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        push_log = NotificationLog.objects.get(channel=NotificationChannel.PUSH)
+        push_log = NotificationLog.objects.get(channel=NotificationChannel.PUSH, is_history=False)
         self.assertEqual(push_log.status, NotificationStatus.PENDING)
 
         with (
@@ -278,7 +354,7 @@ class ReservationBusinessRulesTests(APITestCase):
         )
         response = self.client.post(reverse("reservation-list"), self._reservation_payload(), format="json")
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        push_log = NotificationLog.objects.get(channel=NotificationChannel.PUSH)
+        push_log = NotificationLog.objects.get(channel=NotificationChannel.PUSH, is_history=False)
 
         with (
             override_settings(PUSH_NOTIFICATIONS_ENABLED=True),

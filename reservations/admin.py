@@ -166,8 +166,8 @@ admin.site.register(CancellationRequest)
 
 @admin.register(NotificationLog)
 class NotificationLogAdmin(admin.ModelAdmin):
-    list_display = ("id", "reservation", "channel", "destination", "status", "created_at")
-    list_filter = ("channel", "status")
+    list_display = ("id", "notification_id", "is_history", "reservation", "channel", "destination", "status", "created_at")
+    list_filter = ("channel", "status", "is_history")
     search_fields = ("destination", "reservation__contact_name")
     readonly_fields = ("created_at", "updated_at")
 

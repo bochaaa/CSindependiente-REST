@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+import uuid
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
@@ -74,6 +75,7 @@ class NotificationChannel(models.TextChoices):
 
 
 class NotificationStatus(models.TextChoices):
+    RECORDED = "RECORDED", "Recorded"
     PENDING = "PENDING", "Pending"
     SENT = "SENT", "Sent"
     FAILED = "FAILED", "Failed"
@@ -460,6 +462,8 @@ class CancellationRequest(TimestampedModel):
 
 
 class NotificationLog(TimestampedModel):
+    notification_id = models.UUIDField(default=uuid.uuid4, db_index=True)
+    is_history = models.BooleanField(default=False, db_index=True)
     reservation = models.ForeignKey(
         Reservation,
         on_delete=models.CASCADE,

@@ -172,8 +172,26 @@ def build_reservation_created_push_payload(reservation: Reservation) -> dict:
     }
 
 
+def get_global_notification_history(limit: int = 15):
+    return NotificationLog.objects.filter(
+        channel=NotificationChannel.PUSH,
+        is_history=True,
+    ).order_by("-created_at")[:limit]
+
+
 def queue_reservation_created_push_notifications(reservation: Reservation) -> int:
+    notification_id = uuid4()
     payload = build_reservation_created_push_payload(reservation)
+    payload["data"]["notification_id"] = str(notification_id)
+    NotificationLog.objects.create(
+        notification_id=notification_id,
+        is_history=True,
+        reservation=reservation,
+        channel=NotificationChannel.PUSH,
+        destination="",
+        status=NotificationStatus.RECORDED,
+        payload=payload,
+    )
     devices = NotificationDevice.objects.filter(
         enabled=True,
         provider=NotificationProvider.FCM,
@@ -182,6 +200,7 @@ def queue_reservation_created_push_notifications(reservation: Reservation) -> in
     ).values_list("token", flat=True)
     logs = [
         NotificationLog(
+            notification_id=notification_id,
             reservation=reservation,
             channel=NotificationChannel.PUSH,
             destination=token,
@@ -244,6 +263,7 @@ def send_pending_push_notifications(log_ids: list[int] | None = None, limit: int
     queryset = NotificationLog.objects.filter(
         channel=NotificationChannel.PUSH,
         status=NotificationStatus.PENDING,
+        is_history=False,
     ).order_by("created_at")
     if log_ids is not None:
         queryset = queryset.filter(id__in=log_ids)

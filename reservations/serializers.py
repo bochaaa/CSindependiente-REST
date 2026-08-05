@@ -12,6 +12,7 @@ from .models import (
     ClubSchedule,
     Court,
     NotificationDevice,
+    NotificationLog,
     NotificationProvider,
     PaymentTransaction,
     PaymentTransactionStatus,
@@ -169,6 +170,29 @@ class NotificationDeviceUnregisterSerializer(serializers.Serializer):
         attrs["token"] = token
         attrs["device_id"] = device_id
         return attrs
+
+
+class NotificationHistoryQuerySerializer(serializers.Serializer):
+    limit = serializers.IntegerField(required=False, default=15, min_value=1, max_value=15)
+
+
+class NotificationHistorySerializer(serializers.ModelSerializer):
+    title = serializers.SerializerMethodField()
+    body = serializers.SerializerMethodField()
+    data = serializers.SerializerMethodField()
+
+    class Meta:
+        model = NotificationLog
+        fields = ("notification_id", "title", "body", "data", "created_at")
+
+    def get_title(self, obj):
+        return obj.payload.get("title", "")
+
+    def get_body(self, obj):
+        return obj.payload.get("body", "")
+
+    def get_data(self, obj):
+        return obj.payload.get("data", {})
 
 
 class ReservationPlayerInputSerializer(serializers.Serializer):
