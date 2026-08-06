@@ -240,6 +240,7 @@ CSRF_TRUSTED_ORIGINS = [
 
 MP_ACCESS_TOKEN = env_str("MP_ACCESS_TOKEN", "")
 MP_PUBLIC_KEY = env_str("MP_PUBLIC_KEY", "")
+MP_COLLECTOR_ID = env_str("MP_COLLECTOR_ID", "")
 MP_WEBHOOK_URL = env_str("MP_WEBHOOK_URL", "https://sporturnos.com.ar/api/payments/webhook/")
 FRONTEND_SUCCESS_URL = env_str("FRONTEND_SUCCESS_URL", "https://sporturnos.com.ar/pago/success")
 FRONTEND_FAILURE_URL = env_str("FRONTEND_FAILURE_URL", "https://sporturnos.com.ar/pago/failure")

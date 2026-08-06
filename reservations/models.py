@@ -93,6 +93,7 @@ class NotificationProvider(models.TextChoices):
 class PaymentProvider(models.TextChoices):
     MERCADOPAGO = "mercadopago", "Mercado Pago"
     CASH = "cash", "Cash"
+    TRANSFER = "transfer", "Transferencia QR"
 
 
 class PaymentType(models.TextChoices):

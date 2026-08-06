@@ -12,6 +12,7 @@ from django.db import OperationalError, transaction
 from django.conf import settings
 from django.db.models import F, Q, Sum
 from django.utils import timezone
+from django.utils.dateparse import parse_datetime
 from rest_framework import serializers
 
 from payments.services import mercadopago_service
@@ -1090,6 +1091,123 @@ def register_cash_payment(
     return payment_transaction
 
 
+def _validate_qr_transfer_payment(payment_id: str, payment_data: dict) -> tuple[Decimal, datetime]:
+    if str(payment_data.get("id") or "") != str(payment_id):
+        raise serializers.ValidationError({"payment_id": "Mercado Pago devolvio un pago diferente."})
+    if payment_data.get("status") != PaymentTransactionStatus.APPROVED:
+        status_detail = payment_data.get("status_detail") or payment_data.get("status") or "desconocido"
+        raise serializers.ValidationError(
+            {"payment_id": f"El pago no esta aprobado en Mercado Pago: {status_detail}."}
+        )
+    if payment_data.get("status_detail") != "accredited":
+        raise serializers.ValidationError({"payment_id": "El pago no figura acreditado en Mercado Pago."})
+    if payment_data.get("live_mode") is not True:
+        raise serializers.ValidationError({"payment_id": "No se puede registrar un pago de prueba."})
+    if payment_data.get("currency_id") != "ARS":
+        raise serializers.ValidationError({"payment_id": "El pago debe estar expresado en ARS."})
+
+    point_of_interaction = payment_data.get("point_of_interaction") or {}
+    business_info = point_of_interaction.get("business_info") or {}
+    if business_info.get("branch") != "QR":
+        raise serializers.ValidationError({"payment_id": "El pago no corresponde al QR de Mercado Pago."})
+
+    expected_collector_id = str(getattr(settings, "MP_COLLECTOR_ID", "") or "").strip()
+    if expected_collector_id and str(payment_data.get("collector_id") or "") != expected_collector_id:
+        raise serializers.ValidationError({"payment_id": "El pago no pertenece a la cuenta configurada."})
+
+    amount = quantize_money(payment_data.get("transaction_amount") or "0")
+    refunded_amount = quantize_money(payment_data.get("transaction_amount_refunded") or "0")
+    if amount <= 0:
+        raise serializers.ValidationError({"payment_id": "Mercado Pago informo un monto invalido."})
+    if refunded_amount > 0:
+        raise serializers.ValidationError({"payment_id": "El pago tiene una devolucion y requiere revision."})
+
+    paid_at = parse_datetime(payment_data.get("date_approved") or "")
+    if not paid_at:
+        raise serializers.ValidationError({"payment_id": "Mercado Pago no informo la fecha de acreditacion."})
+    return amount, paid_at
+
+
+def register_qr_transfer_payment(
+    reservation: Reservation,
+    payment_id: str,
+    confirmed_by=None,
+    payment_type: str | None = None,
+    player_id: int | None = None,
+    notes: str = "",
+) -> PaymentTransaction:
+    normalized_payment_id = str(payment_id).strip()
+    if PaymentTransaction.objects.filter(payment_id=normalized_payment_id).exists():
+        raise serializers.ValidationError({"payment_id": "Este pago ya fue registrado."})
+
+    payment_data = mercadopago_service.get_payment(normalized_payment_id)
+    amount, paid_at = _validate_qr_transfer_payment(normalized_payment_id, payment_data)
+
+    with transaction.atomic():
+        locked_reservation = Reservation.objects.select_for_update().get(id=reservation.id)
+        if locked_reservation.status == ReservationStatus.CANCELLED:
+            raise serializers.ValidationError({"detail": "No se puede pagar una reserva cancelada."})
+        if locked_reservation.payment_status == ReservationPaymentStatus.PAID:
+            raise serializers.ValidationError({"detail": "La reserva ya esta pagada."})
+        if locked_reservation.payment_status == ReservationPaymentStatus.EXPIRED:
+            raise serializers.ValidationError({"detail": "No se puede pagar una reserva vencida."})
+        if PaymentTransaction.objects.filter(payment_id=normalized_payment_id).exists():
+            raise serializers.ValidationError({"payment_id": "Este pago ya fue registrado."})
+        if amount > locked_reservation.remaining_amount:
+            raise serializers.ValidationError(
+                {"payment_id": "El monto transferido supera el saldo pendiente de la reserva."}
+            )
+
+        player = None
+        if player_id is not None:
+            player = ReservationPlayer.objects.filter(id=player_id, reservation=locked_reservation).first()
+            if not player:
+                raise serializers.ValidationError({"player_id": "El jugador no pertenece a la reserva."})
+        if payment_type == PaymentType.PLAYER and not player:
+            raise serializers.ValidationError({"player_id": "player_id es requerido para pagos por jugador."})
+        if player and payment_type is None:
+            payment_type = PaymentType.PLAYER
+        if payment_type is None:
+            payment_type = (
+                PaymentType.TOTAL
+                if amount == locked_reservation.remaining_amount
+                else PaymentType.PARTIAL
+            )
+
+        payer = payment_data.get("payer") if isinstance(payment_data.get("payer"), dict) else {}
+        raw_response = {
+            "mercadopago": payment_data,
+            "registration_notes": notes,
+            "confirmed_by_id": getattr(confirmed_by, "id", None),
+            "confirmed_by_username": getattr(confirmed_by, "username", ""),
+        }
+        payment_transaction = PaymentTransaction.objects.create(
+            reservation=locked_reservation,
+            player=player,
+            provider=PaymentProvider.TRANSFER,
+            payment_type=payment_type,
+            payment_id=normalized_payment_id,
+            external_reference=f"TENIS-RESERVA-{locked_reservation.id}-TRANSFER-{normalized_payment_id}",
+            status=PaymentTransactionStatus.APPROVED,
+            status_detail=payment_data.get("status_detail") or "accredited",
+            base_amount=amount,
+            identification_decimal=Decimal("0.00"),
+            mp_amount=amount,
+            amount_received=amount,
+            payer_email=payer.get("email") or "",
+            paid_at=paid_at,
+            raw_response=raw_response,
+        )
+        updated_reservation = recalculate_reservation_payment_state(
+            locked_reservation,
+            now=paid_at,
+        )
+        if updated_reservation.is_paid:
+            updated_reservation.requires_admin_review = False
+            updated_reservation.save(update_fields=("requires_admin_review", "updated_at"))
+        return payment_transaction
+
+
 def build_payment_external_reference(payment_transaction: PaymentTransaction) -> str:
     reservation_id = payment_transaction.reservation_id
     if payment_transaction.payment_type == PaymentType.TOTAL:
@@ -1111,7 +1229,6 @@ def _validate_payment_link_request(
         ReservationPaymentStatus.PAID,
         ReservationPaymentStatus.EXPIRED,
         ReservationPaymentStatus.CANCELLED,
-        ReservationPaymentStatus.REJECTED,
     ):
         raise serializers.ValidationError(
             {"detail": f"No se puede crear un pago para una reserva {reservation.payment_status}."}
@@ -1184,6 +1301,8 @@ def create_reservation_payment_link(
         update_fields=("preference_id", "payment_url", "raw_response", "updated_at")
     )
 
+    recalculate_reservation_payment_state(locked_reservation)
+
     if expires_at and (
         not locked_reservation.payment_expires_at
         or locked_reservation.payment_expires_at < expires_at
@@ -1213,6 +1332,7 @@ def search_payable_reservations_by_participant_or_contact_name(query: str, limit
         payment_status__in=(
             ReservationPaymentStatus.PENDING_PAYMENT,
             ReservationPaymentStatus.PARTIAL_PAYMENT,
+            ReservationPaymentStatus.REJECTED,
         ),
         paid_amount__lt=F("total_price"),
     )
@@ -1267,7 +1387,13 @@ def get_payment_report_transactions(start_date: date, end_date: date, status_fil
         "reservation",
         "reservation__court",
         "player",
-    ).filter(provider__in=(PaymentProvider.MERCADOPAGO, PaymentProvider.CASH))
+    ).filter(
+        provider__in=(
+            PaymentProvider.MERCADOPAGO,
+            PaymentProvider.CASH,
+            PaymentProvider.TRANSFER,
+        )
+    )
 
     if status_filter == "all":
         queryset = queryset.filter(created_at__gte=start_datetime, created_at__lt=end_datetime)

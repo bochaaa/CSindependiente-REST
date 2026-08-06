@@ -35,6 +35,7 @@ from .services import (
     create_reservation,
     get_schedule_for_date,
     register_cash_payment,
+    register_qr_transfer_payment,
     resolve_cancellation_request,
     validate_recurring_rule_availability,
 )
@@ -292,6 +293,30 @@ class CashPaymentCreateSerializer(serializers.Serializer):
             confirmation_password=validated_data["confirmation_password"],
             confirmed_by=request.user if request else None,
             amount=validated_data.get("amount"),
+            payment_type=validated_data.get("payment_type"),
+            player_id=validated_data.get("player_id"),
+            notes=validated_data.get("notes", ""),
+        )
+
+
+class TransferPaymentCreateSerializer(serializers.Serializer):
+    payment_id = serializers.CharField(max_length=120)
+    payment_type = serializers.ChoiceField(choices=PaymentType.choices, required=False)
+    player_id = serializers.IntegerField(required=False)
+    notes = serializers.CharField(required=False, allow_blank=True)
+
+    def validate(self, attrs):
+        if attrs.get("payment_type") == PaymentType.PLAYER and not attrs.get("player_id"):
+            raise serializers.ValidationError({"player_id": "player_id es requerido para pagos por jugador."})
+        return attrs
+
+    def create(self, validated_data):
+        request = self.context.get("request")
+        reservation: Reservation = self.context["reservation"]
+        return register_qr_transfer_payment(
+            reservation=reservation,
+            payment_id=validated_data["payment_id"],
+            confirmed_by=request.user if request else None,
             payment_type=validated_data.get("payment_type"),
             player_id=validated_data.get("player_id"),
             notes=validated_data.get("notes", ""),

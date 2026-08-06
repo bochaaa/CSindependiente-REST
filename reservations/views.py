@@ -60,6 +60,7 @@ from .serializers import (
     ReservationCreateSerializer,
     ReservationSerializer,
     SpecialScheduleSerializer,
+    TransferPaymentCreateSerializer,
 )
 from .services import (
     cancel_reservation_by_admin,
@@ -277,7 +278,7 @@ class ReservationViewSet(
             "search_payments_by_player",
         ):
             return [AllowAny()]
-        if self.action in ("cancel", "mark_payment", "list", "retrieve"):
+        if self.action in ("cancel", "mark_payment", "confirm_transfer_payment", "list", "retrieve"):
             return [IsAdminUser()]
         return super().get_permissions()
 
@@ -336,6 +337,8 @@ class ReservationViewSet(
             return ReservationPaymentLinkCreateSerializer
         if self.action == "confirm_cash_payment":
             return CashPaymentCreateSerializer
+        if self.action == "confirm_transfer_payment":
+            return TransferPaymentCreateSerializer
         if self.action == "payment_status":
             return ReservationPaymentStatusDetailSerializer
         if self.action in ("pending_payments_today", "search_payments_by_player"):
@@ -443,6 +446,27 @@ class ReservationViewSet(
     def confirm_cash_payment(self, request, pk=None):
         reservation = self.get_object()
         serializer = CashPaymentCreateSerializer(
+            data=request.data,
+            context={"reservation": reservation, "request": request},
+        )
+        serializer.is_valid(raise_exception=True)
+        payment_transaction = serializer.save()
+        payment_transaction.reservation.refresh_from_db()
+        response_serializer = ReservationSerializer(payment_transaction.reservation)
+        return Response(response_serializer.data, status=status.HTTP_201_CREATED)
+
+    @extend_schema(
+        description=(
+            "Register an approved Mercado Pago QR transfer by payment ID. "
+            "Validates the payment with Mercado Pago, prevents duplicate use and updates the reservation."
+        ),
+        request=TransferPaymentCreateSerializer,
+        responses={201: ReservationSerializer},
+    )
+    @action(detail=True, methods=("post",), url_path="payments/transfer")
+    def confirm_transfer_payment(self, request, pk=None):
+        reservation = self.get_object()
+        serializer = TransferPaymentCreateSerializer(
             data=request.data,
             context={"reservation": reservation, "request": request},
         )

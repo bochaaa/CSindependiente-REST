@@ -578,6 +578,126 @@ class ReservationBusinessRulesTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertEqual(PaymentTransaction.objects.count(), 0)
 
+    @patch("reservations.services.mercadopago_service.get_payment")
+    def test_register_approved_qr_transfer_payment(self, mocked_get_payment):
+        create_response = self.client.post(reverse("reservation-list"), self._reservation_payload(), format="json")
+        reservation_id = create_response.data["id"]
+        mocked_get_payment.return_value = {
+            "id": 172171288668,
+            "status": "approved",
+            "status_detail": "accredited",
+            "live_mode": True,
+            "currency_id": "ARS",
+            "transaction_amount": 10000,
+            "transaction_amount_refunded": 0,
+            "date_approved": "2026-08-05T09:54:11.000-04:00",
+            "external_reference": "QR Tenis",
+            "payer": {"email": "player@example.com"},
+            "point_of_interaction": {"business_info": {"branch": "QR"}},
+            "transaction_details": {"net_received_amount": 9593.2},
+        }
+
+        self.client.force_authenticate(user=self.admin)
+        response = self.client.post(
+            reverse("reservation-confirm-transfer-payment", args=[reservation_id]),
+            {
+                "payment_id": "172171288668",
+                "payment_type": PaymentType.TOTAL,
+                "notes": "Comprobante presentado en caja",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertTrue(response.data["is_paid"])
+        self.assertEqual(response.data["payment_status"], ReservationPaymentStatus.PAID)
+        transaction = PaymentTransaction.objects.get(payment_id="172171288668")
+        self.assertEqual(transaction.provider, PaymentProvider.TRANSFER)
+        self.assertEqual(transaction.status, PaymentTransactionStatus.APPROVED)
+        self.assertEqual(transaction.base_amount, Decimal("10000.00"))
+        self.assertEqual(transaction.amount_received, Decimal("10000.00"))
+        self.assertEqual(transaction.identification_decimal, Decimal("0.00"))
+        self.assertIsNotNone(transaction.paid_at)
+        self.assertEqual(transaction.raw_response["registration_notes"], "Comprobante presentado en caja")
+
+    @patch("reservations.services.mercadopago_service.get_payment")
+    def test_rejected_qr_transfer_is_not_registered(self, mocked_get_payment):
+        create_response = self.client.post(reverse("reservation-list"), self._reservation_payload(), format="json")
+        reservation_id = create_response.data["id"]
+        mocked_get_payment.return_value = {
+            "id": 172171288668,
+            "status": "rejected",
+            "status_detail": "cc_rejected_high_risk",
+            "live_mode": True,
+            "currency_id": "ARS",
+            "transaction_amount": 10000,
+            "transaction_amount_refunded": 0,
+            "point_of_interaction": {"business_info": {"branch": "QR"}},
+        }
+
+        self.client.force_authenticate(user=self.admin)
+        response = self.client.post(
+            reverse("reservation-confirm-transfer-payment", args=[reservation_id]),
+            {"payment_id": "172171288668"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("payment_id", response.data)
+        self.assertEqual(PaymentTransaction.objects.count(), 0)
+
+    @patch("reservations.services.mercadopago_service.get_payment")
+    def test_qr_transfer_payment_id_cannot_be_registered_twice(self, mocked_get_payment):
+        first_response = self.client.post(reverse("reservation-list"), self._reservation_payload(), format="json")
+        second_response = self.client.post(
+            reverse("reservation-list"),
+            self._reservation_payload(start_time="20:00"),
+            format="json",
+        )
+        mocked_get_payment.return_value = {
+            "id": 172171288668,
+            "status": "approved",
+            "status_detail": "accredited",
+            "live_mode": True,
+            "currency_id": "ARS",
+            "transaction_amount": 10000,
+            "transaction_amount_refunded": 0,
+            "date_approved": "2026-08-05T09:54:11.000-04:00",
+            "point_of_interaction": {"business_info": {"branch": "QR"}},
+        }
+        payload = {"payment_id": "172171288668"}
+
+        self.client.force_authenticate(user=self.admin)
+        first_register = self.client.post(
+            reverse("reservation-confirm-transfer-payment", args=[first_response.data["id"]]),
+            payload,
+            format="json",
+        )
+        second_register = self.client.post(
+            reverse("reservation-confirm-transfer-payment", args=[second_response.data["id"]]),
+            payload,
+            format="json",
+        )
+
+        self.assertEqual(first_register.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(second_register.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("payment_id", second_register.data)
+        self.assertEqual(PaymentTransaction.objects.filter(payment_id="172171288668").count(), 1)
+
+    @patch("reservations.services.mercadopago_service.get_payment")
+    def test_non_admin_cannot_register_qr_transfer(self, mocked_get_payment):
+        create_response = self.client.post(reverse("reservation-list"), self._reservation_payload(), format="json")
+
+        response = self.client.post(
+            reverse("reservation-confirm-transfer-payment", args=[create_response.data["id"]]),
+            {"payment_id": "172171288668"},
+            format="json",
+        )
+
+        self.assertIn(response.status_code, (status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN))
+        mocked_get_payment.assert_not_called()
+        self.assertEqual(PaymentTransaction.objects.count(), 0)
+
     @patch("reservations.services.mercadopago_service.create_checkout_preference_for_reservation_payment")
     def test_create_total_payment_link_uses_checkout_pro_decimal_identifier(self, mocked_create_preference):
         mocked_create_preference.return_value = {
@@ -629,6 +749,41 @@ class ReservationBusinessRulesTests(APITestCase):
             payment_transaction.external_reference.startswith(
                 f"TENIS-RESERVA-{reservation.id}-JUGADOR-{player.id}"
             )
+        )
+
+    @patch("reservations.services.mercadopago_service.create_checkout_preference_for_reservation_payment")
+    def test_rejected_reservation_can_create_a_new_payment_link(self, mocked_create_preference):
+        mocked_create_preference.return_value = {
+            "id": "pref_retry_1",
+            "init_point": "https://mercadopago.example/checkout/retry",
+        }
+        create_response = self.client.post(reverse("reservation-list"), self._reservation_payload(), format="json")
+        reservation = Reservation.objects.get(id=create_response.data["id"])
+        PaymentTransaction.objects.create(
+            reservation=reservation,
+            payment_type=PaymentType.TOTAL,
+            external_reference=f"TENIS-RESERVA-{reservation.id}-TOTAL-rejected",
+            status=PaymentTransactionStatus.REJECTED,
+            base_amount=reservation.total_price,
+            identification_decimal=Decimal("0.19"),
+            mp_amount=reservation.total_price + Decimal("0.19"),
+        )
+        reservation.payment_status = ReservationPaymentStatus.REJECTED
+        reservation.save(update_fields=("payment_status", "updated_at"))
+
+        response = self.client.post(
+            reverse("reservation-create-payment-link", args=[reservation.id]),
+            {"amount": str(reservation.total_price), "payment_type": PaymentType.TOTAL},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        reservation.refresh_from_db()
+        self.assertEqual(reservation.payment_status, ReservationPaymentStatus.PENDING_PAYMENT)
+        self.assertEqual(reservation.paid_amount, Decimal("0.00"))
+        self.assertEqual(
+            list(reservation.payment_transactions.order_by("id").values_list("status", flat=True)),
+            [PaymentTransactionStatus.REJECTED, PaymentTransactionStatus.PENDING],
         )
 
     @patch("reservations.services.mercadopago_service.get_payment")
@@ -788,6 +943,32 @@ class ReservationBusinessRulesTests(APITestCase):
         self.assertEqual(response.data[0]["id"], reservation_id)
         self.assertEqual(response.data[0]["contact_name"], "Maria Gomez")
         self.assertEqual(response.data[0]["matching_players"], [])
+
+    def test_search_payable_reservations_includes_rejected_payment_status(self):
+        create_response = self.client.post(
+            reverse("reservation-list"),
+            self._reservation_payload(
+                players=[
+                    {"first_name": "Ignacio", "last_name": "Acosta", "is_member": True},
+                    {"first_name": "Santi", "last_name": "Fernandez", "is_member": False},
+                ]
+            ),
+            format="json",
+        )
+        reservation = Reservation.objects.get(id=create_response.data["id"])
+        reservation.payment_status = ReservationPaymentStatus.REJECTED
+        reservation.save(update_fields=("payment_status", "updated_at"))
+
+        response = self.client.get(
+            reverse("reservation-search-payments-by-player"),
+            {"q": "Ignacio Acosta"},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["id"], reservation.id)
+        self.assertEqual(response.data[0]["payment_status"], ReservationPaymentStatus.REJECTED)
+        self.assertEqual(response.data[0]["remaining_amount"], "10000.00")
 
     def test_search_payable_reservations_includes_past_unpaid_reservation(self):
         start_datetime = timezone.now() - timedelta(days=1)
@@ -953,6 +1134,46 @@ class ReservationBusinessRulesTests(APITestCase):
         self.assertEqual(rows[0]["monto_reserva"], "10000.00")
         self.assertEqual(rows[0]["decimal_identificador"], "0.00")
         self.assertEqual(rows[0]["nro_operacion_mp"], "")
+
+    @patch("reservations.services.mercadopago_service.get_payment")
+    def test_admin_export_monthly_report_csv_includes_qr_transfers(self, mocked_get_payment):
+        create_response = self.client.post(reverse("reservation-list"), self._reservation_payload(), format="json")
+        mocked_get_payment.return_value = {
+            "id": 172171288668,
+            "status": "approved",
+            "status_detail": "accredited",
+            "live_mode": True,
+            "currency_id": "ARS",
+            "transaction_amount": 10000,
+            "transaction_amount_refunded": 0,
+            "date_approved": timezone.now().isoformat(),
+            "external_reference": "QR Tenis",
+            "point_of_interaction": {"business_info": {"branch": "QR"}},
+        }
+        self.client.force_authenticate(user=self.admin)
+        transfer_response = self.client.post(
+            reverse("reservation-confirm-transfer-payment", args=[create_response.data["id"]]),
+            {"payment_id": "172171288668"},
+            format="json",
+        )
+        self.assertEqual(transfer_response.status_code, status.HTTP_201_CREATED)
+
+        self.client.force_authenticate(user=self.admin)
+        response = self.client.get(
+            reverse("mercadopago-report-csv"),
+            {
+                "start_date": timezone.localdate().isoformat(),
+                "end_date": timezone.localdate().isoformat(),
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        rows = list(csv.DictReader(StringIO(response.content.decode("utf-8"))))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["metodo_pago"], PaymentProvider.TRANSFER)
+        self.assertEqual(rows[0]["estado"], PaymentTransactionStatus.APPROVED)
+        self.assertEqual(rows[0]["monto_reserva"], "10000.00")
+        self.assertEqual(rows[0]["nro_operacion_mp"], "172171288668")
 
     def test_non_admin_cannot_export_mercadopago_report_csv(self):
         response = self.client.get(
