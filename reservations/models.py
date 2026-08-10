@@ -112,6 +112,11 @@ class PaymentTransactionStatus(models.TextChoices):
     AMOUNT_MISMATCH = "amount_mismatch", "Amount mismatch"
 
 
+class PaymentExemptionReason(models.TextChoices):
+    EMPLOYEE = "employee", "Empleado"
+    CLUB_PLAYER = "club_player", "Jugador del club"
+
+
 class Court(TimestampedModel):
     name = models.CharField(max_length=100, unique=True)
     active = models.BooleanField(default=True)
@@ -348,6 +353,20 @@ class ReservationPlayer(TimestampedModel):
     last_name = models.CharField(max_length=100)
     is_member = models.BooleanField(default=False)
     price_applied = models.DecimalField(max_digits=10, decimal_places=2)
+    is_payment_exempt = models.BooleanField(default=False)
+    payment_exemption_reason = models.CharField(
+        max_length=20,
+        choices=PaymentExemptionReason.choices,
+        blank=True,
+    )
+    payment_exempted_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="payment_exempted_reservation_players",
+    )
+    payment_exempted_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         ordering = ("id",)

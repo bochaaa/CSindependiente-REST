@@ -47,6 +47,7 @@ from .serializers import (
     NotificationDeviceUnregisterSerializer,
     NotificationHistoryQuerySerializer,
     NotificationHistorySerializer,
+    PlayerPaymentExemptionSerializer,
     PriceRuleSerializer,
     PlayerReservationPaymentSearchSerializer,
     ReservationPaymentSearchResultSerializer,
@@ -278,7 +279,14 @@ class ReservationViewSet(
             "search_payments_by_player",
         ):
             return [AllowAny()]
-        if self.action in ("cancel", "mark_payment", "confirm_transfer_payment", "list", "retrieve"):
+        if self.action in (
+            "cancel",
+            "mark_payment",
+            "set_player_payment_exemption",
+            "confirm_transfer_payment",
+            "list",
+            "retrieve",
+        ):
             return [IsAdminUser()]
         return super().get_permissions()
 
@@ -384,6 +392,33 @@ class ReservationViewSet(
 
     @extend_schema(
         description=(
+            "Apply or remove an employee/club-player payment exemption. Admin only. "
+            "The player's original price is retained for audit, but excluded from the payable reservation total."
+        ),
+        request=PlayerPaymentExemptionSerializer,
+        responses={200: ReservationSerializer},
+    )
+    @action(
+        detail=True,
+        methods=("patch",),
+        url_path=r"players/(?P<player_id>\d+)/payment-exemption",
+    )
+    def set_player_payment_exemption(self, request, pk=None, player_id=None):
+        reservation = self.get_object()
+        serializer = PlayerPaymentExemptionSerializer(
+            data=request.data,
+            context={
+                "reservation": reservation,
+                "player_id": player_id,
+                "request": request,
+            },
+        )
+        serializer.is_valid(raise_exception=True)
+        updated = serializer.save()
+        return Response(ReservationSerializer(updated).data)
+
+    @extend_schema(
+        description=(
             "Create a cancellation request for a reservation. Public endpoint. "
             "The reservation remains CONFIRMED until admin decision. "
             "It is only allowed until 3 hours before start time. Public endpoint with 20/min throttling."
@@ -457,8 +492,8 @@ class ReservationViewSet(
 
     @extend_schema(
         description=(
-            "Register an approved Mercado Pago QR transfer by payment ID. "
-            "Validates the payment with Mercado Pago, prevents duplicate use and updates the reservation."
+            "Register an approved QR transfer. Validates a payment ID with Mercado Pago, or allows an "
+            "admin to confirm an external-wallet receipt manually, then updates the reservation."
         ),
         request=TransferPaymentCreateSerializer,
         responses={201: ReservationSerializer},

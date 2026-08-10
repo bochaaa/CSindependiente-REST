@@ -110,12 +110,16 @@ def get_schedule_for_date(target_date: date) -> tuple[time, time] | None:
 
 
 def validate_players_for_game_mode(game_mode: str, players: list[dict]):
-    expected_count = 2 if game_mode == GameMode.SINGLES else 4
     if game_mode not in (GameMode.SINGLES, GameMode.DOUBLES):
         raise serializers.ValidationError({"game_mode": "game_mode must be SINGLES or DOUBLES."})
-    if len(players) != expected_count:
+
+    if game_mode == GameMode.SINGLES and len(players) != 2:
         raise serializers.ValidationError(
-            {"players": f"{game_mode} requires exactly {expected_count} players."}
+            {"players": "SINGLES requires exactly 2 players."}
+        )
+    if game_mode == GameMode.DOUBLES and len(players) < 4:
+        raise serializers.ValidationError(
+            {"players": "DOUBLES requires at least 4 players."}
         )
 
 
@@ -1006,6 +1010,126 @@ def validate_cash_payment_confirmation_password(confirmation_password: str):
         raise serializers.ValidationError({"confirmation_password": "Clave de confirmacion incorrecta."})
 
 
+@transaction.atomic
+def set_player_payment_exemption(
+    reservation: Reservation,
+    player_id: int,
+    is_exempt: bool,
+    reason: str = "",
+    confirmed_by=None,
+) -> Reservation:
+    locked_reservation = Reservation.objects.select_for_update().get(id=reservation.id)
+    if locked_reservation.status == ReservationStatus.CANCELLED:
+        raise serializers.ValidationError(
+            {"detail": "No se puede modificar la exencion de una reserva cancelada."}
+        )
+
+    player = (
+        ReservationPlayer.objects.select_for_update()
+        .filter(id=player_id, reservation=locked_reservation)
+        .first()
+    )
+    if not player:
+        raise serializers.ValidationError({"player_id": "El jugador no pertenece a la reserva."})
+    if not is_exempt and not player.is_payment_exempt:
+        return locked_reservation
+
+    applying_new_exemption = is_exempt and not player.is_payment_exempt
+    if applying_new_exemption:
+        has_pending_payment = PaymentTransaction.objects.filter(
+            reservation=locked_reservation,
+            status__in=(PaymentTransactionStatus.PENDING, PaymentTransactionStatus.IN_PROCESS),
+        ).exists()
+        if has_pending_payment:
+            raise serializers.ValidationError(
+                {"detail": "No se puede eximir un jugador mientras exista un pago pendiente."}
+            )
+        if PaymentTransaction.objects.filter(
+            reservation=locked_reservation,
+            player=player,
+            status=PaymentTransactionStatus.APPROVED,
+        ).exists():
+            raise serializers.ValidationError(
+                {"player_id": "El jugador ya tiene un pago aprobado y no puede ser eximido."}
+            )
+
+        new_total = (
+            ReservationPlayer.objects.filter(
+                reservation=locked_reservation,
+                is_payment_exempt=False,
+            )
+            .exclude(id=player.id)
+            .aggregate(total=Sum("price_applied"))["total"]
+            or Decimal("0.00")
+        )
+        approved_amount = (
+            PaymentTransaction.objects.filter(
+                reservation=locked_reservation,
+                status=PaymentTransactionStatus.APPROVED,
+            ).aggregate(total=Sum("base_amount"))["total"]
+            or Decimal("0.00")
+        )
+        if approved_amount > new_total:
+            raise serializers.ValidationError(
+                {"detail": "La exencion produciria un sobrepago y requiere revision administrativa."}
+            )
+
+    authenticated_user = _get_authenticated_user(confirmed_by)
+    if is_exempt:
+        player.is_payment_exempt = True
+        player.payment_exemption_reason = reason
+        player.payment_exempted_by = authenticated_user
+        player.payment_exempted_at = timezone.now()
+    else:
+        player.is_payment_exempt = False
+        player.payment_exemption_reason = ""
+        player.payment_exempted_by = None
+        player.payment_exempted_at = None
+    player.save(
+        update_fields=(
+            "is_payment_exempt",
+            "payment_exemption_reason",
+            "payment_exempted_by",
+            "payment_exempted_at",
+            "updated_at",
+        )
+    )
+
+    locked_reservation.total_price = (
+        ReservationPlayer.objects.filter(
+            reservation=locked_reservation,
+            is_payment_exempt=False,
+        ).aggregate(total=Sum("price_applied"))["total"]
+        or Decimal("0.00")
+    )
+    locked_reservation.save(update_fields=("total_price", "updated_at"))
+    updated_reservation = recalculate_reservation_payment_state(locked_reservation)
+    if updated_reservation.is_paid:
+        updated_reservation.requires_admin_review = False
+        updated_reservation.paid_confirmed_by = authenticated_user
+    else:
+        updated_reservation.paid_confirmed_by = None
+        if updated_reservation.paid_amount == 0:
+            updated_reservation.payment_status = ReservationPaymentStatus.PENDING_PAYMENT
+    updated_reservation.save(
+        update_fields=(
+            "requires_admin_review",
+            "paid_confirmed_by",
+            "payment_status",
+            "updated_at",
+        )
+    )
+    logger.info(
+        "Updated payment exemption reservation=%s player=%s exempt=%s reason=%s admin=%s",
+        locked_reservation.id,
+        player.id,
+        is_exempt,
+        reason if is_exempt else "",
+        getattr(authenticated_user, "id", None),
+    )
+    return updated_reservation
+
+
 def _get_authenticated_user(user):
     if getattr(user, "is_authenticated", False):
         return user
@@ -1040,6 +1164,8 @@ def register_cash_payment(
         player = ReservationPlayer.objects.filter(id=player_id, reservation=locked_reservation).first()
         if not player:
             raise serializers.ValidationError({"player_id": "El jugador no pertenece a esta reserva."})
+        if player.is_payment_exempt:
+            raise serializers.ValidationError({"player_id": "El jugador esta exento de pago."})
 
     if payment_type == PaymentType.PLAYER and not player:
         raise serializers.ValidationError({"player_id": "player_id es requerido para pagos por jugador."})
@@ -1128,15 +1254,139 @@ def _validate_qr_transfer_payment(payment_id: str, payment_data: dict) -> tuple[
     return amount, paid_at
 
 
-def register_qr_transfer_payment(
+@transaction.atomic
+def _register_manually_confirmed_external_wallet_payment(
     reservation: Reservation,
     payment_id: str,
     confirmed_by=None,
+    amount=None,
     payment_type: str | None = None,
     player_id: int | None = None,
     notes: str = "",
 ) -> PaymentTransaction:
-    normalized_payment_id = str(payment_id).strip()
+    locked_reservation = Reservation.objects.select_for_update().get(id=reservation.id)
+    if locked_reservation.status == ReservationStatus.CANCELLED:
+        raise serializers.ValidationError({"detail": "No se puede pagar una reserva cancelada."})
+    if locked_reservation.payment_status == ReservationPaymentStatus.PAID:
+        raise serializers.ValidationError({"detail": "La reserva ya esta pagada."})
+    if locked_reservation.payment_status == ReservationPaymentStatus.EXPIRED:
+        raise serializers.ValidationError({"detail": "No se puede pagar una reserva vencida."})
+    if payment_id and PaymentTransaction.objects.filter(payment_id=payment_id).exists():
+        raise serializers.ValidationError({"payment_id": "Este pago ya fue registrado."})
+
+    player = None
+    player_remaining_amount = None
+    if player_id is not None:
+        player = ReservationPlayer.objects.filter(id=player_id, reservation=locked_reservation).first()
+        if not player:
+            raise serializers.ValidationError({"player_id": "El jugador no pertenece a la reserva."})
+        if player.is_payment_exempt:
+            raise serializers.ValidationError({"player_id": "El jugador esta exento de pago."})
+        player_paid_amount = (
+            PaymentTransaction.objects.filter(
+                reservation=locked_reservation,
+                player=player,
+                status=PaymentTransactionStatus.APPROVED,
+            ).aggregate(total=Sum("base_amount"))["total"]
+            or Decimal("0.00")
+        )
+        player_remaining_amount = quantize_money(max(player.price_applied - player_paid_amount, Decimal("0.00")))
+
+    if payment_type == PaymentType.PLAYER and not player:
+        raise serializers.ValidationError({"player_id": "player_id es requerido para pagos por jugador."})
+    if player and payment_type is None:
+        payment_type = PaymentType.PLAYER
+
+    if amount is None:
+        if payment_type == PaymentType.PARTIAL:
+            raise serializers.ValidationError(
+                {"amount": "amount es requerido para confirmar un pago parcial de otra billetera."}
+            )
+        manual_amount = player_remaining_amount if player else locked_reservation.remaining_amount
+    else:
+        manual_amount = quantize_money(amount)
+
+    if manual_amount <= 0:
+        raise serializers.ValidationError({"amount": "El monto debe ser mayor a 0."})
+    if manual_amount > locked_reservation.remaining_amount:
+        raise serializers.ValidationError({"amount": "El monto no puede superar el saldo pendiente."})
+    if player_remaining_amount is not None and manual_amount > player_remaining_amount:
+        raise serializers.ValidationError({"amount": "El monto no puede superar el saldo pendiente del jugador."})
+    if payment_type == PaymentType.TOTAL and manual_amount != locked_reservation.remaining_amount:
+        raise serializers.ValidationError({"amount": "Un pago total debe cubrir todo el saldo pendiente."})
+    if payment_type is None:
+        payment_type = (
+            PaymentType.TOTAL
+            if manual_amount == locked_reservation.remaining_amount
+            else PaymentType.PARTIAL
+        )
+
+    now = timezone.now()
+    authenticated_user = _get_authenticated_user(confirmed_by)
+    payment_transaction = PaymentTransaction.objects.create(
+        reservation=locked_reservation,
+        player=player,
+        provider=PaymentProvider.TRANSFER,
+        payment_type=payment_type,
+        payment_id=payment_id or None,
+        external_reference=f"TENIS-RESERVA-{locked_reservation.id}-TRANSFER-MANUAL-{uuid4().hex}",
+        status=PaymentTransactionStatus.APPROVED,
+        status_detail="external_wallet_confirmed_by_admin",
+        base_amount=manual_amount,
+        identification_decimal=Decimal("0.00"),
+        mp_amount=manual_amount,
+        amount_received=manual_amount,
+        paid_at=now,
+        raw_response={
+            "source": "external_wallet_manual_confirmation",
+            "receipt_reference": payment_id,
+            "registration_notes": notes,
+            "confirmed_by_id": authenticated_user.id if authenticated_user else None,
+            "confirmed_by_username": authenticated_user.username if authenticated_user else "",
+        },
+    )
+    updated_reservation = recalculate_reservation_payment_state(locked_reservation, now=now)
+    if updated_reservation.is_paid:
+        updated_reservation.requires_admin_review = False
+        if authenticated_user and not updated_reservation.paid_confirmed_by_id:
+            updated_reservation.paid_confirmed_by = authenticated_user
+        updated_reservation.save(
+            update_fields=("requires_admin_review", "paid_confirmed_by", "updated_at")
+        )
+    logger.info(
+        "Registered manually confirmed external-wallet payment transaction=%s reservation=%s amount=%s",
+        payment_transaction.id,
+        locked_reservation.id,
+        manual_amount,
+    )
+    return payment_transaction
+
+
+def register_qr_transfer_payment(
+    reservation: Reservation,
+    payment_id: str | None,
+    confirmed_by=None,
+    confirmed_external_wallet: bool = False,
+    amount=None,
+    payment_type: str | None = None,
+    player_id: int | None = None,
+    notes: str = "",
+) -> PaymentTransaction:
+    normalized_payment_id = str(payment_id or "").strip()
+    if confirmed_external_wallet:
+        return _register_manually_confirmed_external_wallet_payment(
+            reservation=reservation,
+            payment_id=normalized_payment_id,
+            confirmed_by=confirmed_by,
+            amount=amount,
+            payment_type=payment_type,
+            player_id=player_id,
+            notes=notes,
+        )
+    if not normalized_payment_id:
+        raise serializers.ValidationError(
+            {"payment_id": "payment_id es requerido para validar el pago con Mercado Pago."}
+        )
     if PaymentTransaction.objects.filter(payment_id=normalized_payment_id).exists():
         raise serializers.ValidationError({"payment_id": "Este pago ya fue registrado."})
 
@@ -1163,6 +1413,8 @@ def register_qr_transfer_payment(
             player = ReservationPlayer.objects.filter(id=player_id, reservation=locked_reservation).first()
             if not player:
                 raise serializers.ValidationError({"player_id": "El jugador no pertenece a la reserva."})
+            if player.is_payment_exempt:
+                raise serializers.ValidationError({"player_id": "El jugador esta exento de pago."})
         if payment_type == PaymentType.PLAYER and not player:
             raise serializers.ValidationError({"player_id": "player_id es requerido para pagos por jugador."})
         if player and payment_type is None:
@@ -1242,6 +1494,8 @@ def _validate_payment_link_request(
             raise serializers.ValidationError({"player_id": "player_id es requerido para pagos por jugador."})
         if player.reservation_id != reservation.id:
             raise serializers.ValidationError({"player_id": "El jugador no pertenece a esta reserva."})
+        if player.is_payment_exempt:
+            raise serializers.ValidationError({"player_id": "El jugador esta exento de pago."})
 
 
 @transaction.atomic

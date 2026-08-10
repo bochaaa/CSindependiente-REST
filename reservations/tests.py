@@ -27,6 +27,7 @@ from .models import (
     NotificationLog,
     NotificationProvider,
     NotificationStatus,
+    PaymentExemptionReason,
     PaymentProvider,
     PaymentTransaction,
     PaymentTransactionStatus,
@@ -384,6 +385,50 @@ class ReservationBusinessRulesTests(APITestCase):
         self.assertEqual(response.data["total_price"], "17000.00")
         self.assertEqual(len(response.data["players"]), 4)
 
+    def test_create_doubles_reservation_with_six_members(self):
+        players = [
+            {"first_name": f"Socio{i}", "last_name": "Test", "is_member": True}
+            for i in range(1, 7)
+        ]
+        payload = self._reservation_payload(game_mode=GameMode.DOUBLES, players=players)
+
+        response = self.client.post(reverse("reservation-list"), payload, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data["total_price"], "21000.00")
+        self.assertEqual(len(response.data["players"]), 6)
+        self.assertTrue(all(player["price_applied"] == "3500.00" for player in response.data["players"]))
+
+    def test_create_doubles_reservation_with_extra_members_and_non_members(self):
+        players = [
+            {"first_name": "Socio1", "last_name": "Test", "is_member": True},
+            {"first_name": "Socio2", "last_name": "Test", "is_member": True},
+            {"first_name": "Socio3", "last_name": "Test", "is_member": True},
+            {"first_name": "Invitado1", "last_name": "Test", "is_member": False},
+            {"first_name": "Invitado2", "last_name": "Test", "is_member": False},
+            {"first_name": "Invitado3", "last_name": "Test", "is_member": False},
+        ]
+        payload = self._reservation_payload(game_mode=GameMode.DOUBLES, players=players)
+
+        response = self.client.post(reverse("reservation-list"), payload, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data["total_price"], "25500.00")
+        self.assertEqual(len(response.data["players"]), 6)
+
+    def test_reject_doubles_reservation_with_fewer_than_four_players(self):
+        players = [
+            {"first_name": "A", "last_name": "Uno", "is_member": True},
+            {"first_name": "B", "last_name": "Dos", "is_member": True},
+            {"first_name": "C", "last_name": "Tres", "is_member": False},
+        ]
+        payload = self._reservation_payload(game_mode=GameMode.DOUBLES, players=players)
+
+        response = self.client.post(reverse("reservation-list"), payload, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("players", response.data)
+
     def test_reject_invalid_singles_player_count(self):
         players = [
             {"first_name": "A", "last_name": "Uno", "is_member": True},
@@ -579,6 +624,125 @@ class ReservationBusinessRulesTests(APITestCase):
         self.assertEqual(PaymentTransaction.objects.count(), 0)
 
     @patch("reservations.services.mercadopago_service.get_payment")
+    def test_employee_exemption_reduces_total_and_is_not_reported_as_payment(self, mocked_get_payment):
+        create_response = self.client.post(reverse("reservation-list"), self._reservation_payload(), format="json")
+        reservation = Reservation.objects.get(id=create_response.data["id"])
+        employee = reservation.players.order_by("id").first()
+
+        self.client.force_authenticate(user=self.admin)
+        exemption_response = self.client.patch(
+            reverse("reservation-set-player-payment-exemption", args=[reservation.id, employee.id]),
+            {
+                "is_exempt": True,
+                "reason": PaymentExemptionReason.EMPLOYEE,
+            },
+            format="json",
+        )
+
+        self.assertEqual(exemption_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(exemption_response.data["total_price"], "6000.00")
+        self.assertEqual(exemption_response.data["remaining_amount"], "6000.00")
+        self.assertEqual(exemption_response.data["payment_status"], ReservationPaymentStatus.PENDING_PAYMENT)
+        exempt_player = next(player for player in exemption_response.data["players"] if player["id"] == employee.id)
+        self.assertEqual(exempt_player["price_applied"], "4000.00")
+        self.assertTrue(exempt_player["is_payment_exempt"])
+        self.assertEqual(exempt_player["payment_exemption_reason"], PaymentExemptionReason.EMPLOYEE)
+        self.assertEqual(exempt_player["payment_exempted_by"], self.admin.id)
+        self.assertEqual(PaymentTransaction.objects.count(), 0)
+
+        payment_response = self.client.post(
+            reverse("reservation-confirm-transfer-payment", args=[reservation.id]),
+            {
+                "payment_id": "galicia-non-member-payment",
+                "confirmed_external_wallet": True,
+                "payment_type": PaymentType.TOTAL,
+            },
+            format="json",
+        )
+
+        self.assertEqual(payment_response.status_code, status.HTTP_201_CREATED)
+        mocked_get_payment.assert_not_called()
+        self.assertTrue(payment_response.data["is_paid"])
+        self.assertEqual(payment_response.data["paid_amount"], "6000.00")
+        self.assertEqual(PaymentTransaction.objects.count(), 1)
+
+        today = timezone.localdate().isoformat()
+        report_response = self.client.get(
+            reverse("mercadopago-report-csv"),
+            {"start_date": today, "end_date": today},
+        )
+        rows = list(csv.DictReader(StringIO(report_response.content.decode("utf-8"))))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["monto_reserva"], "6000.00")
+        self.assertEqual(rows[0]["metodo_pago"], PaymentProvider.TRANSFER)
+
+    def test_non_admin_cannot_set_player_payment_exemption(self):
+        create_response = self.client.post(reverse("reservation-list"), self._reservation_payload(), format="json")
+        reservation = Reservation.objects.get(id=create_response.data["id"])
+        player = reservation.players.order_by("id").first()
+        self.client.force_authenticate(user=self.normal_user)
+
+        response = self.client.patch(
+            reverse("reservation-set-player-payment-exemption", args=[reservation.id, player.id]),
+            {"is_exempt": True, "reason": PaymentExemptionReason.CLUB_PLAYER},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        player.refresh_from_db()
+        self.assertFalse(player.is_payment_exempt)
+
+    def test_removing_player_exemption_restores_original_total(self):
+        create_response = self.client.post(reverse("reservation-list"), self._reservation_payload(), format="json")
+        reservation = Reservation.objects.get(id=create_response.data["id"])
+        player = reservation.players.order_by("id").first()
+        self.client.force_authenticate(user=self.admin)
+        endpoint = reverse("reservation-set-player-payment-exemption", args=[reservation.id, player.id])
+        self.client.patch(
+            endpoint,
+            {"is_exempt": True, "reason": PaymentExemptionReason.CLUB_PLAYER},
+            format="json",
+        )
+
+        response = self.client.patch(endpoint, {"is_exempt": False}, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["total_price"], "10000.00")
+        restored_player = next(item for item in response.data["players"] if item["id"] == player.id)
+        self.assertFalse(restored_player["is_payment_exempt"])
+        self.assertEqual(restored_player["payment_exemption_reason"], "")
+
+    @patch("reservations.services.mercadopago_service.create_checkout_preference_for_reservation_payment")
+    def test_player_exemption_is_rejected_when_payment_is_pending(self, mocked_create_preference):
+        mocked_create_preference.return_value = {
+            "id": "pref_pending_exemption",
+            "init_point": "https://mercadopago.example/checkout/pending-exemption",
+        }
+        create_response = self.client.post(reverse("reservation-list"), self._reservation_payload(), format="json")
+        reservation = Reservation.objects.get(id=create_response.data["id"])
+        player = reservation.players.order_by("id").first()
+        self.client.post(
+            reverse("reservation-create-payment-link", args=[reservation.id]),
+            {
+                "amount": str(player.price_applied),
+                "payment_type": PaymentType.PLAYER,
+                "player_id": player.id,
+            },
+            format="json",
+        )
+        self.client.force_authenticate(user=self.admin)
+
+        response = self.client.patch(
+            reverse("reservation-set-player-payment-exemption", args=[reservation.id, player.id]),
+            {"is_exempt": True, "reason": PaymentExemptionReason.EMPLOYEE},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        player.refresh_from_db()
+        self.assertFalse(player.is_payment_exempt)
+
+    @patch("reservations.services.mercadopago_service.get_payment")
     def test_register_approved_qr_transfer_payment(self, mocked_get_payment):
         create_response = self.client.post(reverse("reservation-list"), self._reservation_payload(), format="json")
         reservation_id = create_response.data["id"]
@@ -619,6 +783,124 @@ class ReservationBusinessRulesTests(APITestCase):
         self.assertEqual(transaction.identification_decimal, Decimal("0.00"))
         self.assertIsNotNone(transaction.paid_at)
         self.assertEqual(transaction.raw_response["registration_notes"], "Comprobante presentado en caja")
+
+    @patch("reservations.services.mercadopago_service.get_payment")
+    def test_admin_can_manually_confirm_external_wallet_qr_with_receipt_payment_id(self, mocked_get_payment):
+        create_response = self.client.post(reverse("reservation-list"), self._reservation_payload(), format="json")
+        reservation_id = create_response.data["id"]
+
+        self.client.force_authenticate(user=self.admin)
+        response = self.client.post(
+            reverse("reservation-confirm-transfer-payment", args=[reservation_id]),
+            {
+                "confirmed_external_wallet": True,
+                "payment_id": "galicia-total-a3b33491d5da",
+                "payment_type": PaymentType.TOTAL,
+                "notes": "Pago desde Galicia confirmado por el administrador",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        mocked_get_payment.assert_not_called()
+        self.assertTrue(response.data["is_paid"])
+        self.assertEqual(response.data["paid_amount"], "10000.00")
+        self.assertEqual(response.data["payment_transactions"][0]["provider"], PaymentProvider.TRANSFER)
+
+        transaction = PaymentTransaction.objects.get(reservation_id=reservation_id)
+        self.assertEqual(transaction.payment_id, "galicia-total-a3b33491d5da")
+        self.assertEqual(transaction.status, PaymentTransactionStatus.APPROVED)
+        self.assertEqual(transaction.status_detail, "external_wallet_confirmed_by_admin")
+        self.assertEqual(transaction.base_amount, Decimal("10000.00"))
+        self.assertEqual(transaction.raw_response["source"], "external_wallet_manual_confirmation")
+        self.assertEqual(transaction.raw_response["confirmed_by_id"], self.admin.id)
+
+        today = timezone.localdate().isoformat()
+        report_response = self.client.get(
+            reverse("mercadopago-report-csv"),
+            {"start_date": today, "end_date": today},
+        )
+        rows = list(csv.DictReader(StringIO(report_response.content.decode("utf-8"))))
+        self.assertEqual(report_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["metodo_pago"], PaymentProvider.TRANSFER)
+        self.assertEqual(rows[0]["monto_reserva"], "10000.00")
+
+    @patch("reservations.services.mercadopago_service.get_payment")
+    def test_admin_external_wallet_player_payment_uses_player_outstanding_amount(self, mocked_get_payment):
+        create_response = self.client.post(reverse("reservation-list"), self._reservation_payload(), format="json")
+        reservation = Reservation.objects.get(id=create_response.data["id"])
+        player = reservation.players.order_by("id").first()
+
+        self.client.force_authenticate(user=self.admin)
+        response = self.client.post(
+            reverse("reservation-confirm-transfer-payment", args=[reservation.id]),
+            {
+                "confirmed_external_wallet": True,
+                "payment_id": "a3b33491d5da",
+                "payment_type": PaymentType.PLAYER,
+                "player_id": player.id,
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        mocked_get_payment.assert_not_called()
+        self.assertFalse(response.data["is_paid"])
+        self.assertEqual(response.data["payment_status"], ReservationPaymentStatus.PARTIAL_PAYMENT)
+        self.assertEqual(response.data["paid_amount"], "4000.00")
+        transaction = PaymentTransaction.objects.get(payment_id="a3b33491d5da")
+        self.assertEqual(transaction.player_id, player.id)
+        self.assertEqual(transaction.base_amount, player.price_applied)
+
+    def test_transfer_requires_payment_id_without_external_wallet_confirmation(self):
+        create_response = self.client.post(reverse("reservation-list"), self._reservation_payload(), format="json")
+        self.client.force_authenticate(user=self.admin)
+
+        response = self.client.post(
+            reverse("reservation-confirm-transfer-payment", args=[create_response.data["id"]]),
+            {"payment_type": PaymentType.TOTAL},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("payment_id", response.data)
+        self.assertEqual(PaymentTransaction.objects.count(), 0)
+
+    def test_external_wallet_partial_payment_requires_amount(self):
+        create_response = self.client.post(reverse("reservation-list"), self._reservation_payload(), format="json")
+        self.client.force_authenticate(user=self.admin)
+
+        response = self.client.post(
+            reverse("reservation-confirm-transfer-payment", args=[create_response.data["id"]]),
+            {
+                "confirmed_external_wallet": True,
+                "payment_id": "galicia-partial-a3b33491d5da",
+                "payment_type": PaymentType.PARTIAL,
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("amount", response.data)
+        self.assertEqual(PaymentTransaction.objects.count(), 0)
+
+    def test_external_wallet_confirmation_requires_receipt_payment_id(self):
+        create_response = self.client.post(reverse("reservation-list"), self._reservation_payload(), format="json")
+        self.client.force_authenticate(user=self.admin)
+
+        response = self.client.post(
+            reverse("reservation-confirm-transfer-payment", args=[create_response.data["id"]]),
+            {
+                "confirmed_external_wallet": True,
+                "payment_type": PaymentType.TOTAL,
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("payment_id", response.data)
+        self.assertEqual(PaymentTransaction.objects.count(), 0)
 
     @patch("reservations.services.mercadopago_service.get_payment")
     def test_rejected_qr_transfer_is_not_registered(self, mocked_get_payment):

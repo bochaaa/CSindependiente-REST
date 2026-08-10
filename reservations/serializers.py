@@ -14,6 +14,7 @@ from .models import (
     NotificationDevice,
     NotificationLog,
     NotificationProvider,
+    PaymentExemptionReason,
     PaymentTransaction,
     PaymentTransactionStatus,
     PaymentType,
@@ -37,6 +38,7 @@ from .services import (
     register_cash_payment,
     register_qr_transfer_payment,
     resolve_cancellation_request,
+    set_player_payment_exemption,
     validate_recurring_rule_availability,
 )
 
@@ -76,9 +78,26 @@ class PriceRuleSerializer(serializers.ModelSerializer):
 
 
 class ReservationPlayerSerializer(serializers.ModelSerializer):
+    payment_exempted_by_username = serializers.CharField(
+        source="payment_exempted_by.username",
+        read_only=True,
+    )
+
     class Meta:
         model = ReservationPlayer
-        fields = ("id", "first_name", "last_name", "is_member", "price_applied")
+        fields = (
+            "id",
+            "first_name",
+            "last_name",
+            "is_member",
+            "price_applied",
+            "is_payment_exempt",
+            "payment_exemption_reason",
+            "payment_exempted_by",
+            "payment_exempted_by_username",
+            "payment_exempted_at",
+        )
+        read_only_fields = fields
 
 
 class PaymentTransactionSerializer(serializers.ModelSerializer):
@@ -272,6 +291,28 @@ class ReservationPaymentStatusSerializer(serializers.Serializer):
     is_paid = serializers.BooleanField()
 
 
+class PlayerPaymentExemptionSerializer(serializers.Serializer):
+    is_exempt = serializers.BooleanField()
+    reason = serializers.ChoiceField(choices=PaymentExemptionReason.choices, required=False)
+
+    def validate(self, attrs):
+        if attrs["is_exempt"] and not attrs.get("reason"):
+            raise serializers.ValidationError(
+                {"reason": "reason es requerido al eximir el pago de un jugador."}
+            )
+        return attrs
+
+    def create(self, validated_data):
+        request = self.context.get("request")
+        return set_player_payment_exemption(
+            reservation=self.context["reservation"],
+            player_id=self.context["player_id"],
+            is_exempt=validated_data["is_exempt"],
+            reason=validated_data.get("reason", ""),
+            confirmed_by=request.user if request else None,
+        )
+
+
 class CashPaymentCreateSerializer(serializers.Serializer):
     confirmation_password = serializers.CharField(write_only=True, trim_whitespace=False)
     amount = serializers.DecimalField(max_digits=10, decimal_places=2, required=False)
@@ -300,14 +341,29 @@ class CashPaymentCreateSerializer(serializers.Serializer):
 
 
 class TransferPaymentCreateSerializer(serializers.Serializer):
-    payment_id = serializers.CharField(max_length=120)
+    payment_id = serializers.CharField(max_length=120, required=False)
+    confirmed_external_wallet = serializers.BooleanField(required=False, default=False)
+    amount = serializers.DecimalField(max_digits=10, decimal_places=2, required=False)
     payment_type = serializers.ChoiceField(choices=PaymentType.choices, required=False)
     player_id = serializers.IntegerField(required=False)
     notes = serializers.CharField(required=False, allow_blank=True)
 
     def validate(self, attrs):
-        if attrs.get("payment_type") == PaymentType.PLAYER and not attrs.get("player_id"):
+        confirmed_external_wallet = attrs.get("confirmed_external_wallet", False)
+        payment_type = attrs.get("payment_type")
+        if not attrs.get("payment_id"):
+            message = (
+                "payment_id es requerido para identificar el comprobante de la otra billetera."
+                if confirmed_external_wallet
+                else "payment_id es requerido para validar el pago con Mercado Pago."
+            )
+            raise serializers.ValidationError({"payment_id": message})
+        if payment_type == PaymentType.PLAYER and not attrs.get("player_id"):
             raise serializers.ValidationError({"player_id": "player_id es requerido para pagos por jugador."})
+        if confirmed_external_wallet and payment_type == PaymentType.PARTIAL and attrs.get("amount") is None:
+            raise serializers.ValidationError(
+                {"amount": "amount es requerido para confirmar un pago parcial de otra billetera."}
+            )
         return attrs
 
     def create(self, validated_data):
@@ -315,8 +371,10 @@ class TransferPaymentCreateSerializer(serializers.Serializer):
         reservation: Reservation = self.context["reservation"]
         return register_qr_transfer_payment(
             reservation=reservation,
-            payment_id=validated_data["payment_id"],
+            payment_id=validated_data.get("payment_id"),
             confirmed_by=request.user if request else None,
+            confirmed_external_wallet=validated_data.get("confirmed_external_wallet", False),
+            amount=validated_data.get("amount"),
             payment_type=validated_data.get("payment_type"),
             player_id=validated_data.get("player_id"),
             notes=validated_data.get("notes", ""),
