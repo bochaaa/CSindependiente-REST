@@ -309,6 +309,36 @@ No bloquean:
 - cancelled
 - rejected
 
+Búsqueda de pagos por jugador:
+
+- `GET /api/reservations/payments/search-by-player/?q={nombre}` incluye reservas con
+  `payment_status` `pending_payment`, `partial_payment` o `rejected` mientras exista saldo pendiente.
+- Una reserva `rejected` puede generar un nuevo enlace de Mercado Pago. Al crearlo vuelve a
+  `pending_payment` y conserva el intento rechazado en el historial de transacciones.
+
+Registro manual de transferencias QR:
+
+- `POST /api/reservations/{id}/payments/transfer/` es exclusivo para administradores autenticados
+  y recibe el `payment_id` del comprobante cuando esta disponible.
+- El backend consulta el pago con `MP_ACCESS_TOKEN` y valida estado aprobado, moneda ARS,
+  origen QR, monto sin devolver y uso unico del identificador.
+- Para comprobantes de Galicia u otra billetera sin identificador interno de Mercado Pago, el admin
+  debe enviar el identificador visible junto con `confirmed_external_wallet=true`. En ese modo no se
+  consulta Mercado Pago: el importe se obtiene del saldo total o del jugador; un pago `partial`
+  requiere `amount`.
+- La confirmacion externa guarda el admin, notas y la referencia visible en `raw_response`.
+- Se registra como `provider=transfer`, actualiza el saldo de la reserva y se incluye en el
+  reporte mensual junto con Mercado Pago Checkout y efectivo.
+
+Exenciones de pago por jugador:
+
+- Un administrador puede marcar un jugador como `employee` o `club_player` mediante
+  `PATCH /api/reservations/{id}/players/{player_id}/payment-exemption/`.
+- Se conserva `price_applied` como valor original, pero se excluye del total cobrable de la reserva.
+- La exencion guarda administrador y fecha, no crea `PaymentTransaction`, no suma en `paid_amount`
+  y no genera filas en el reporte CSV.
+- No puede aplicarse con pagos pendientes, sobre un jugador que ya pago ni si produce sobrepago.
+
 Frontend Angular:
 Flujo sugerido:
 

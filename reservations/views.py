@@ -6,6 +6,7 @@ from django.contrib.auth import get_user_model
 from django.http import HttpResponse
 from django.db.models import Prefetch
 from django.db import OperationalError, transaction
+from django.utils import timezone
 from drf_spectacular.utils import OpenApiParameter, OpenApiResponse, extend_schema, extend_schema_view
 from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
@@ -18,6 +19,7 @@ from rest_framework_simplejwt.serializers import TokenObtainPairSerializer, Toke
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 
 from .models import (
+    BlockType,
     BlockedSlot,
     CancellationRequest,
     ClubSchedule,
@@ -33,7 +35,9 @@ from .permissions import IsAdminOrReadOnly
 from .serializers import (
     AvailabilityResponseSerializer,
     AuthUserSerializer,
+    BlockedSlotBulkCreateSerializer,
     BlockedSlotSerializer,
+    BlockTypeChoiceSerializer,
     CancelReservationSerializer,
     CashPaymentCreateSerializer,
     CancellationRequestCreateSerializer,
@@ -690,6 +694,23 @@ class BlockedSlotViewSet(viewsets.ModelViewSet):
     http_method_names = ("get", "post", "delete")
     permission_classes = (IsAdminOrReadOnly,)
 
+    @extend_schema(
+        description="Create one blocked slot per court in a single atomic request. Admin only.",
+        request=BlockedSlotBulkCreateSerializer,
+        responses={201: BlockedSlotSerializer(many=True)},
+    )
+    def create(self, request, *args, **kwargs):
+        if "courts" not in request.data:
+            return super().create(request, *args, **kwargs)
+        serializer = BlockedSlotBulkCreateSerializer(
+            data=request.data,
+            context=self.get_serializer_context(),
+        )
+        serializer.is_valid(raise_exception=True)
+        blocked_slots = serializer.save()
+        response_serializer = self.get_serializer(blocked_slots, many=True)
+        return Response(response_serializer.data, status=status.HTTP_201_CREATED)
+
     def get_queryset(self):
         queryset = super().get_queryset()
         date_filter = self.request.query_params.get("date")
@@ -700,6 +721,26 @@ class BlockedSlotViewSet(viewsets.ModelViewSet):
             except ValueError:
                 return queryset.none()
         return queryset
+
+    @extend_schema(
+        description="List the accepted block_type values.",
+        responses={200: BlockTypeChoiceSerializer(many=True)},
+    )
+    @action(detail=False, methods=("get",), url_path="block-types")
+    def block_types(self, request):
+        return Response(
+            [{"value": value, "label": label} for value, label in BlockType.choices]
+        )
+
+    @extend_schema(
+        description="List current and future blocked slots whose end_datetime has not passed.",
+        responses={200: BlockedSlotSerializer(many=True)},
+    )
+    @action(detail=False, methods=("get",), url_path="upcoming")
+    def upcoming(self, request):
+        queryset = self.get_queryset().filter(end_datetime__gt=timezone.now())
+        serializer = self.get_serializer(queryset, many=True)
+        return Response(serializer.data)
 
 
 @extend_schema(

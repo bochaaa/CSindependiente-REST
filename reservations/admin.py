@@ -15,9 +15,14 @@ from .models import (
     RecurringReservationRule,
     Reservation,
     ReservationPlayer,
+    ReservationStatus,
     SpecialSchedule,
 )
-from .services import deactivate_recurring_rule, delete_recurring_rule_and_cancel_future_classes
+from .services import (
+    cancel_reservation_by_admin,
+    deactivate_recurring_rule,
+    delete_recurring_rule_and_cancel_future_classes,
+)
 
 
 class RecurringReservationRuleAdminForm(forms.ModelForm):
@@ -105,10 +110,35 @@ class ReservationAdmin(admin.ModelAdmin):
         "start_datetime",
         "end_datetime",
     )
-    list_filter = ("status", "payment_status", "reservation_type", "court", "is_paid")
+    list_filter = (
+        "status",
+        "payment_status",
+        "reservation_type",
+        "court",
+        "is_paid",
+        ("start_datetime", admin.DateFieldListFilter),
+    )
     search_fields = ("contact_name", "title", "contact_phone", "court__name")
     ordering = ("-start_datetime",)
     readonly_fields = ("created_at", "updated_at", "cancelled_at", "paid_at")
+    actions = ("cancel_selected_reservations",)
+
+    @admin.action(description="Cancelar reservas seleccionadas (sin borrarlas)")
+    def cancel_selected_reservations(self, request, queryset):
+        cancelled_count = 0
+        for reservation in queryset:
+            if reservation.status == ReservationStatus.CANCELLED:
+                continue
+            cancel_reservation_by_admin(
+                reservation=reservation,
+                cancelled_by=request.user,
+                cancellation_reason="Cancelada desde Django admin.",
+            )
+            cancelled_count += 1
+        self.message_user(request, f"Reservas canceladas: {cancelled_count}.")
+
+    def has_delete_permission(self, request, obj=None):
+        return False
 
 
 admin.site.register(Court)

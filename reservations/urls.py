@@ -30,14 +30,14 @@ router.register("blocked-slots", BlockedSlotViewSet, basename="blocked-slot")
 router.register("cancellation-requests", CancellationRequestViewSet, basename="cancellation-request")
 
 urlpatterns = [
-    path("", include(router.urls)),
-    path("notifications/", NotificationHistoryAPIView.as_view(), name="notification-history"),
-    path("availability/", AvailabilityAPIView.as_view(), name="availability"),
     path(
         "recurring-rules/generate/",
         GenerateRecurringReservationsAPIView.as_view(),
         name="generate-recurring-reservations",
     ),
+    path("", include(router.urls)),
+    path("notifications/", NotificationHistoryAPIView.as_view(), name="notification-history"),
+    path("availability/", AvailabilityAPIView.as_view(), name="availability"),
     path("payments/webhook/", PaymentWebhookAPIView.as_view(), name="payment-webhook"),
     path(
         "payments/reports/mercadopago.csv/",

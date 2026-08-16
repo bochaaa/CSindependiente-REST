@@ -164,6 +164,67 @@ def get_blocking_reservation_queryset():
     )
 
 
+def validate_blocked_slot_availability(
+    *,
+    courts: list[Court],
+    start_datetime: datetime,
+    end_datetime: datetime,
+) -> None:
+    conflicting_court_ids = list(
+        get_blocking_reservation_queryset()
+        .filter(
+            court__in=courts,
+            start_datetime__lt=end_datetime,
+            end_datetime__gt=start_datetime,
+        )
+        .values_list("court_id", flat=True)
+        .distinct()
+    )
+    if conflicting_court_ids:
+        raise serializers.ValidationError(
+            {
+                "courts": (
+                    "No se puede bloquear: hay reservas activas en ese rango "
+                    f"para las canchas {sorted(conflicting_court_ids)}."
+                )
+            }
+        )
+
+
+@transaction.atomic
+def create_blocked_slots(
+    *,
+    courts: list[Court],
+    start_datetime: datetime,
+    end_datetime: datetime,
+    block_type: str,
+    reason: str = "",
+    created_by=None,
+) -> list[BlockedSlot]:
+    # Lock the selected courts so concurrent bulk requests cannot interleave.
+    locked_courts = list(
+        Court.objects.select_for_update().filter(pk__in=[court.pk for court in courts])
+    )
+    validate_blocked_slot_availability(
+        courts=locked_courts,
+        start_datetime=start_datetime,
+        end_datetime=end_datetime,
+    )
+    return BlockedSlot.objects.bulk_create(
+        [
+            BlockedSlot(
+                court=court,
+                start_datetime=start_datetime,
+                end_datetime=end_datetime,
+                block_type=block_type,
+                reason=reason,
+                created_by=created_by,
+            )
+            for court in locked_courts
+        ]
+    )
+
+
 def build_reservation_created_push_payload(reservation: Reservation) -> dict:
     start_datetime = timezone.localtime(reservation.start_datetime)
     return {
@@ -357,6 +418,16 @@ def check_recurring_rule_overlap(
             continue
         rule_end_time = _time_plus_class_duration(rule.start_time)
         if rule.start_time < local_end.time() and rule_end_time > local_start.time():
+            occurrence_start = combine_local_datetime(local_start.date(), rule.start_time)
+            cancelled_occurrence_exists = Reservation.objects.filter(
+                court=court,
+                recurring_rule=rule,
+                reservation_type=ReservationType.CLASS,
+                start_datetime=occurrence_start,
+                status=ReservationStatus.CANCELLED,
+            ).exists()
+            if cancelled_occurrence_exists:
+                continue
             return True
     return False
 

@@ -1630,6 +1630,108 @@ class ReservationBusinessRulesTests(APITestCase):
         self.assertTrue(available_8_16["can_book_90_min"])
         self.assertEqual(available_8_16["can_start_until"], "14:30:00")
 
+    def test_cancelled_class_occurrence_frees_holiday_slot_for_normal_reservation(self):
+        target_date = timezone.localdate() + timedelta(days=1)
+        day = DayOfWeek.values[target_date.weekday()]
+        rule = RecurringReservationRule.objects.create(
+            court=self.court,
+            title="Clase suspendida por feriado",
+            days_of_week=[day],
+            start_time=time(hour=16, minute=0),
+            start_date=target_date,
+            active=True,
+            created_by=self.admin,
+        )
+        generate_recurring_reservations(days_ahead=7)
+        generated_class = Reservation.objects.get(recurring_rule=rule)
+
+        self.client.force_authenticate(user=self.admin)
+        cancel_response = self.client.patch(
+            reverse("reservation-cancel", args=[generated_class.id]),
+            {"cancellation_reason": "Clase suspendida por feriado"},
+            format="json",
+        )
+        self.assertEqual(cancel_response.status_code, status.HTTP_200_OK)
+
+        self.client.force_authenticate(user=None)
+        availability_response = self.client.get(
+            f"{reverse('availability')}?date={target_date.isoformat()}"
+        )
+        self.assertEqual(availability_response.status_code, status.HTTP_200_OK)
+        self.assertFalse(
+            any(
+                item["reservation_type"] == ReservationType.CLASS
+                for item in availability_response.data["courts"][0]["unavailable_ranges"]
+            )
+        )
+
+        reservation_response = self.client.post(
+            reverse("reservation-list"),
+            self._reservation_payload(target_date=target_date, start_time="16:00"),
+            format="json",
+        )
+        self.assertEqual(reservation_response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(reservation_response.data["reservation_type"], ReservationType.NORMAL)
+
+        self.assertEqual(generate_recurring_reservations(days_ahead=7), 0)
+        generated_class.refresh_from_db()
+        self.assertEqual(generated_class.status, ReservationStatus.CANCELLED)
+
+    def test_generate_endpoint_recreates_deleted_class_occurrences_automatically(self):
+        target_date = timezone.localdate() + timedelta(days=1)
+        day = DayOfWeek.values[target_date.weekday()]
+        rule = RecurringReservationRule.objects.create(
+            court=self.court,
+            title="Clase eliminada por error",
+            days_of_week=[day],
+            start_time=time(hour=16, minute=0),
+            start_date=target_date,
+            active=True,
+            created_by=self.admin,
+        )
+        generate_recurring_reservations(days_ahead=1)
+        Reservation.objects.get(recurring_rule=rule).delete()
+
+        self.client.force_authenticate(user=self.admin)
+        response = self.client.post(
+            f"{reverse('generate-recurring-reservations')}?days_ahead=1",
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["created"], 1)
+        self.assertTrue(
+            Reservation.objects.filter(
+                recurring_rule=rule,
+                reservation_type=ReservationType.CLASS,
+                start_datetime__date=target_date,
+                status=ReservationStatus.CONFIRMED,
+            ).exists()
+        )
+
+    def test_django_admin_does_not_allow_physical_reservation_deletion(self):
+        start_datetime = timezone.now() + timedelta(days=1)
+        reservation = Reservation.objects.create(
+            court=self.court,
+            reservation_type=ReservationType.CLASS,
+            title="Clase a cancelar",
+            contact_name="Admin",
+            contact_phone="N/A",
+            start_datetime=start_datetime,
+            end_datetime=start_datetime + timedelta(minutes=60),
+            status=ReservationStatus.CONFIRMED,
+        )
+        self.admin.is_superuser = True
+        self.admin.save(update_fields=("is_superuser",))
+        self.client.force_login(self.admin)
+
+        response = self.client.get(
+            reverse("admin:reservations_reservation_delete", args=[reservation.id])
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertTrue(Reservation.objects.filter(id=reservation.id).exists())
+
     def test_recurring_rule_create_endpoint_generates_classes_automatically(self):
         target_date = timezone.localdate() + timedelta(days=1)
         day = DayOfWeek.values[target_date.weekday()]
@@ -2239,6 +2341,136 @@ class ReservationBusinessRulesTests(APITestCase):
         self.assertEqual(detail_response.status_code, status.HTTP_200_OK)
         self.assertEqual(detail_response.data["id"], self.admin.id)
         self.assertEqual(detail_response.data["username"], "admin")
+
+
+class BlockedSlotEndpointTests(APITestCase):
+    def setUp(self):
+        self.admin = get_user_model().objects.create_user(
+            username="blocked-slot-admin",
+            password="admin123",
+            is_staff=True,
+        )
+        self.court = Court.objects.create(name="Cancha bloqueos", active=True)
+
+    def test_block_types_lists_values_for_the_frontend(self):
+        response = self.client.get(reverse("blocked-slot-block-types"))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            response.data,
+            [
+                {"value": BlockType.TOURNAMENT, "label": "Tournament"},
+                {"value": BlockType.MAINTENANCE, "label": "Maintenance"},
+                {"value": BlockType.OTHER, "label": "Other"},
+            ],
+        )
+
+    def test_upcoming_excludes_expired_and_includes_current_and_future_blocks(self):
+        now = timezone.now()
+        expired = BlockedSlot.objects.create(
+            court=self.court,
+            start_datetime=now - timedelta(hours=2),
+            end_datetime=now - timedelta(hours=1),
+            block_type=BlockType.OTHER,
+        )
+        current = BlockedSlot.objects.create(
+            court=self.court,
+            start_datetime=now - timedelta(minutes=30),
+            end_datetime=now + timedelta(minutes=30),
+            block_type=BlockType.MAINTENANCE,
+        )
+        future = BlockedSlot.objects.create(
+            court=self.court,
+            start_datetime=now + timedelta(hours=1),
+            end_datetime=now + timedelta(hours=2),
+            block_type=BlockType.TOURNAMENT,
+        )
+
+        with patch("reservations.views.timezone.now", return_value=now):
+            response = self.client.get(reverse("blocked-slot-upcoming"))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            [item["id"] for item in response.data],
+            [current.id, future.id],
+        )
+        self.assertNotIn(expired.id, [item["id"] for item in response.data])
+
+    def test_admin_can_create_one_independent_block_per_court_in_one_request(self):
+        second_court = Court.objects.create(name="Segunda cancha", active=True)
+        start_datetime = timezone.now() + timedelta(days=1)
+        self.client.force_authenticate(user=self.admin)
+
+        response = self.client.post(
+            reverse("blocked-slot-list"),
+            {
+                "courts": [self.court.id, second_court.id],
+                "start_datetime": start_datetime.isoformat(),
+                "end_datetime": (start_datetime + timedelta(hours=8)).isoformat(),
+                "block_type": BlockType.TOURNAMENT,
+                "reason": "Torneo de día completo",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(len(response.data), 2)
+        self.assertEqual(BlockedSlot.objects.count(), 2)
+        self.assertEqual(
+            {item["court"] for item in response.data},
+            {self.court.id, second_court.id},
+        )
+
+    def test_bulk_create_is_atomic_when_one_court_has_an_active_reservation(self):
+        second_court = Court.objects.create(name="Segunda cancha", active=True)
+        start_datetime = timezone.now() + timedelta(days=1)
+        end_datetime = start_datetime + timedelta(hours=8)
+        Reservation.objects.create(
+            court=second_court,
+            reservation_type=ReservationType.NORMAL,
+            game_mode=GameMode.SINGLES,
+            contact_name="Cliente",
+            contact_phone="2302000000",
+            start_datetime=start_datetime + timedelta(hours=1),
+            end_datetime=start_datetime + timedelta(hours=2),
+            status=ReservationStatus.CONFIRMED,
+        )
+        self.client.force_authenticate(user=self.admin)
+
+        response = self.client.post(
+            reverse("blocked-slot-list"),
+            {
+                "courts": [self.court.id, second_court.id],
+                "start_datetime": start_datetime.isoformat(),
+                "end_datetime": end_datetime.isoformat(),
+                "block_type": BlockType.MAINTENANCE,
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("courts", response.data)
+        self.assertEqual(BlockedSlot.objects.count(), 0)
+
+    def test_single_court_create_remains_backward_compatible(self):
+        start_datetime = timezone.now() + timedelta(days=1)
+        self.client.force_authenticate(user=self.admin)
+
+        response = self.client.post(
+            reverse("blocked-slot-list"),
+            {
+                "court": self.court.id,
+                "start_datetime": start_datetime.isoformat(),
+                "end_datetime": (start_datetime + timedelta(hours=1)).isoformat(),
+                "block_type": BlockType.OTHER,
+                "reason": "Bloqueo individual",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data["court"], self.court.id)
+        self.assertEqual(BlockedSlot.objects.count(), 1)
 
 
 class SeedInitialDataCommandTests(TestCase):

@@ -6,6 +6,7 @@ from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 
 from .models import (
+    BlockType,
     BlockedSlot,
     CancellationRequest,
     CancellationRequestStatus,
@@ -30,9 +31,9 @@ from .models import (
 )
 from .services import (
     CLASS_RESERVATION_MINUTES,
+    create_blocked_slots,
     create_cancellation_request,
     create_reservation_payment_link,
-    get_blocking_reservation_queryset,
     create_reservation,
     get_schedule_for_date,
     register_cash_payment,
@@ -40,6 +41,7 @@ from .services import (
     resolve_cancellation_request,
     set_player_payment_exemption,
     validate_recurring_rule_availability,
+    validate_blocked_slot_availability,
 )
 
 
@@ -677,19 +679,64 @@ class BlockedSlotSerializer(serializers.ModelSerializer):
         end_datetime = attrs.get("end_datetime") or getattr(self.instance, "end_datetime", None)
         if start_datetime >= end_datetime:
             raise serializers.ValidationError({"end_datetime": "end_datetime must be later than start_datetime."})
-        if court and get_blocking_reservation_queryset().filter(
-            court=court,
-            start_datetime__lt=end_datetime,
-            end_datetime__gt=start_datetime,
-        ).exists():
-            raise serializers.ValidationError({"detail": "No se puede bloquear: hay reservas activas en ese rango."})
+        if court:
+            validate_blocked_slot_availability(
+                courts=[court],
+                start_datetime=start_datetime,
+                end_datetime=end_datetime,
+            )
         return attrs
 
     def create(self, validated_data):
         request = self.context.get("request")
+        created_by = None
         if request and getattr(request.user, "is_authenticated", False):
-            validated_data["created_by"] = request.user
-        return super().create(validated_data)
+            created_by = request.user
+        court = validated_data.pop("court")
+        return create_blocked_slots(
+            courts=[court],
+            created_by=created_by,
+            **validated_data,
+        )[0]
+
+
+class BlockedSlotBulkCreateSerializer(serializers.Serializer):
+    courts = serializers.PrimaryKeyRelatedField(
+        queryset=Court.objects.all(),
+        many=True,
+        allow_empty=False,
+    )
+    start_datetime = serializers.DateTimeField()
+    end_datetime = serializers.DateTimeField()
+    block_type = serializers.ChoiceField(choices=BlockType.choices)
+    reason = serializers.CharField(required=False, allow_blank=True, max_length=255, default="")
+
+    def validate(self, attrs):
+        courts = attrs["courts"]
+        if len({court.pk for court in courts}) != len(courts):
+            raise serializers.ValidationError({"courts": "No se permiten canchas repetidas."})
+        if attrs["start_datetime"] >= attrs["end_datetime"]:
+            raise serializers.ValidationError(
+                {"end_datetime": "end_datetime must be later than start_datetime."}
+            )
+        validate_blocked_slot_availability(
+            courts=courts,
+            start_datetime=attrs["start_datetime"],
+            end_datetime=attrs["end_datetime"],
+        )
+        return attrs
+
+    def create(self, validated_data):
+        request = self.context.get("request")
+        created_by = None
+        if request and getattr(request.user, "is_authenticated", False):
+            created_by = request.user
+        return create_blocked_slots(created_by=created_by, **validated_data)
+
+
+class BlockTypeChoiceSerializer(serializers.Serializer):
+    value = serializers.CharField()
+    label = serializers.CharField()
 
 
 class AvailabilityRangeSerializer(serializers.Serializer):

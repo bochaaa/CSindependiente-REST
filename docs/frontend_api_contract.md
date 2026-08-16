@@ -60,6 +60,8 @@ Response 200:
 - `GET /api/availability/?date=YYYY-MM-DD`
 - `POST /api/reservations/`
 - `POST /api/reservations/{id}/request-cancellation/`
+- `GET /api/reservations/payments/search-by-player/?q={nombre}`
+- `POST /api/reservations/{id}/payments/cash/` (requiere clave compartida)
 
 ## 3.2 Admin (requiere JWT admin)
 
@@ -101,6 +103,8 @@ Response 200:
 - `POST /api/notification-devices/`
 - `DELETE /api/notification-devices/{id}/`
 - `POST /api/notification-devices/unregister/`
+- `POST /api/reservations/{id}/payments/transfer/`
+- `PATCH /api/reservations/{id}/players/{player_id}/payment-exemption/`
 
 ## 4) Payloads clave
 
@@ -295,12 +299,141 @@ Payload previsto para push cuando se crea una reserva:
   "title": "Nueva reserva",
   "body": "Cancha 2 - 18:00 hs",
   "data": {
+    "notification_id": "5a852f31-e48e-45d3-a851-fb70c98c06f9",
     "type": "reservation_created",
     "reservation_id": "123",
     "url": "/admin/reservations?date=2026-06-29"
   }
 }
 ```
+
+## 4.6 Historial global de notificaciones (admin)
+
+Todos los administradores consultan el mismo historial. El backend toma la identidad de
+`request.user`; el frontend no debe enviar `user_id`.
+
+`GET /api/notifications/?limit=15`
+
+Headers:
+
+- `Authorization: Bearer <access_token>`
+
+`limit` es opcional, vale `15` por defecto y admite valores entre `1` y `15`. La respuesta
+esta ordenada por `created_at` descendente.
+
+Response 200:
+
+```json
+[
+  {
+    "notification_id": "5a852f31-e48e-45d3-a851-fb70c98c06f9",
+    "title": "Nueva reserva",
+    "body": "Cancha 2 - 18:00 hs",
+    "data": {
+      "notification_id": "5a852f31-e48e-45d3-a851-fb70c98c06f9",
+      "type": "reservation_created",
+      "reservation_id": "123",
+      "url": "/admin/reservations?date=2026-06-29"
+    },
+    "created_at": "2026-06-29T17:30:00-03:00"
+  }
+]
+```
+
+El frontend debe combinar este historial con los pushes locales usando `notification_id`
+como clave de deduplicacion.
+
+## 4.7 Registrar transferencia por QR
+
+El endpoint admite dos formas de confirmacion. Si el comprobante contiene el `payment_id` de Mercado
+Pago, el backend consulta Mercado Pago y solo registra la transaccion si esta aprobada, acreditada,
+en ARS, corresponde a un QR real y no fue utilizada antes.
+
+`POST /api/reservations/{id}/payments/transfer/`
+
+```json
+{
+  "payment_id": "172171288668",
+  "payment_type": "player",
+  "player_id": 79,
+  "notes": "Comprobante presentado en caja"
+}
+```
+
+Cuando el cliente pago el QR de Mercado Pago desde Galicia u otra billetera y el comprobante no
+expone el identificador interno de Mercado Pago, un administrador puede confirmarlo manualmente:
+
+```json
+{
+  "confirmed_external_wallet": true,
+  "payment_id": "a3b33491d5da",
+  "payment_type": "player",
+  "player_id": 79,
+  "notes": "Pago desde Galicia corroborado por el administrador"
+}
+```
+
+En esta modalidad `payment_id` es obligatorio y contiene la referencia visible de la otra
+billetera. No puede volver a utilizarse. El backend no consulta Mercado Pago y deja
+registrado el usuario administrador que hizo la confirmacion.
+
+- `payment_type=total`: registra el saldo pendiente completo de la reserva.
+- `payment_type=player`: requiere `player_id` y registra el saldo pendiente de ese jugador.
+- `payment_type=partial`: requiere `amount`, que debe ser mayor a cero y no superar el saldo pendiente.
+
+Una respuesta `201` devuelve la reserva actualizada y agrega en `payment_transactions` una
+transaccion con `provider: "transfer"` y `status: "approved"`. Ambos tipos de transferencia se
+incluyen en el resumen de pagos y en el reporte mensual CSV.
+
+Este endpoint requiere un JWT de usuario administrador en `Authorization: Bearer <access_token>`.
+
+Errores esperables (`400`): pago rechazado o pendiente, comprobante ya utilizado, pago que no es QR,
+pago de prueba, moneda distinta de ARS, pago devuelto, jugador incorrecto o monto superior al saldo.
+
+La transferencia se incluye automaticamente en el reporte mensual CSV con
+`metodo_pago=transfer` y el `payment_id` en `nro_operacion_mp`.
+
+## 4.8 Eximir del pago a un empleado o jugador del club
+
+La exencion se aplica al jugador y no genera una transaccion de pago. Conserva `price_applied`
+como precio original para auditoria, pero descuenta ese importe de `total_price` y
+`remaining_amount` de la reserva.
+
+`PATCH /api/reservations/{id}/players/{player_id}/payment-exemption/`
+
+```json
+{
+  "is_exempt": true,
+  "reason": "employee"
+}
+```
+
+Valores admitidos para `reason`:
+
+- `employee`: empleado.
+- `club_player`: jugador del club.
+
+Para quitar la exencion:
+
+```json
+{
+  "is_exempt": false
+}
+```
+
+El endpoint es exclusivo para administradores. La respuesta contiene la reserva completa y cada
+jugador expone:
+
+- `is_payment_exempt`
+- `payment_exemption_reason`
+- `payment_exempted_by`
+- `payment_exempted_by_username`
+- `payment_exempted_at`
+
+La exencion no crea una `PaymentTransaction`, no incrementa `paid_amount` y no aparece como movimiento
+en el reporte CSV. Si el resto del saldo se paga, el reporte contiene solamente el dinero efectivamente
+cobrado. No se puede aplicar una exencion mientras exista un pago pendiente, si el jugador ya tiene un
+pago aprobado o si la reduccion produciria un sobrepago.
 
 ## 5) Reglas de negocio vigentes
 
@@ -309,7 +442,7 @@ Payload previsto para push cuando se crea una reserva:
 - Reserva normal (`reservation_type=NORMAL`): duracion fija 90 minutos.
 - Clase (`reservation_type=CLASS`): duracion fija 60 minutos.
 - `SINGLES` exige 2 jugadores.
-- `DOUBLES` exige 4 jugadores.
+- `DOUBLES` exige un minimo de 4 jugadores y permite agregar jugadores adicionales.
 
 ## 5.2 Precios
 
@@ -355,7 +488,9 @@ Payload previsto para push cuando se crea una reserva:
 ## 5.7 Notificaciones
 
 - El admin registra tokens FCM con `POST /api/notification-devices/`.
+- El backend registra una entrada de historial global al generar el aviso, aunque no haya dispositivos activos o FCM falle.
 - Al crear una reserva normal, backend crea `NotificationLog` `PUSH` pendiente para cada dispositivo activo de admins.
+- El historial y todos los intentos FCM del mismo aviso comparten `notification_id`.
 - Si `PUSH_NOTIFICATIONS_ENABLED=True` y Firebase esta configurado en backend, el backend envia el push real por FCM y marca el log como `SENT`.
 - Si Firebase no esta configurado, el log queda como `PENDING` o `FAILED` segun la configuracion, sin romper la creacion de la reserva.
 - No hay envio real de WhatsApp/email en esta etapa.
